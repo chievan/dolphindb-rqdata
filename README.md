@@ -582,6 +582,12 @@ tb = RQData::rqGetPrice("license", "<License Key>", ["AU2412"], 2024.10.08, 2024
 
 ## 8. 版本更新说明 (Changelog)
 
+### v1.5.3（syncRqData）
+
+- `rqToDate` 改为向量化（`substr` 逐元素截取），修复 `all_instruments` 整列传入时报 “A scalar object is expected”。
+- `rqSyncBars` 去掉对 DFS 表句柄的 `isNull` 判断（DFS 表不支持该调用）。
+- `rqDominantIds` 的分组聚合改为引用表内列，修复主映射整列取到同一个合约（如 AU88 被写成 BC2612）的问题。
+
 ### v1.5.2（syncRqData）
 
 - 库名恢复为 `dfs://RQDATA.futu_bar` / `futu_contract` / `futu_calendar` / `futu_synclog`，表名仍为 `data`。

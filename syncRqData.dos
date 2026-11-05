@@ -48,7 +48,7 @@ module syncRqData
  *   rqBackfillAll(user, pwd, startDate)              全历史回补（日线）
  *   rqRegisterJob()                                  注册每日 17:00 定时任务
  *
- * 版本: 1.5.2
+ * 版本: 1.5.3
  */
 
 // ============================================================================
@@ -61,7 +61,7 @@ def module_info() {
      */
     res = dict(STRING, ANY)
     res["moduleName"] = "syncRqData"
-    res["moduleVersion"] = "1.5.2"
+    res["moduleVersion"] = "1.5.3"
     res["isFree"] = true
     res["description"] = "DolphinDB syncRqData Module (Futures ETL via RQData)"
     return res
@@ -149,7 +149,8 @@ def rqToDouble(v) {
 def rqToDate(v) {
     s = trim(string(v))
     // 兼容 "yyyy-MM-dd" 与 "yyyy-MM-dd HH:mm:ss"（分钟线 trading_date 返回的是后者）
-    if(strlen(s) > 10) s = substr(s, 0, 10)
+    // 支持标量与向量：substr 逐元素截取，不足 10 位时返回原串
+    s = substr(s, 0, 10)
     // 连续合约（88/888/99）的上市/退市日返回 0000-00-00，按 NULL 处理（视为始终存续）
     s = iif(s == "0000-00-00", "", s)
     return temporalParse(s, "yyyy-MM-dd")
@@ -457,8 +458,9 @@ def rqDominantIds(user, pwd, varieties, startDate, endDate, batchSize=20) {
         if("date" in cols) d = rqToDate(raw["date"])
         else if("datetime" in cols) d = rqToDate(raw["datetime"])
         did = trim(string(raw["dominant_id"]))
-        t = select last(did) as dominant_id from table(var as variety, d as trade_date, did as dominant_id)
-            group by variety, trade_date
+        // 注意：聚合必须引用表内列，直接 last(did) 会按全列取值（函数作用域下会退化为广播）
+        tt = table(var as variety, d as trade_date, did as dominant_id)
+        t = select last(dominant_id) as dominant_id from tt group by variety, trade_date
         out = unionAll(out, t)
     }
     return out
@@ -661,7 +663,7 @@ def rqSyncBars(user, pwd, startDate, endDate, frequency="1d", batchSize=50) {
         }
 
         // contract 由“交易日 × 上市合约”生成，与当日是否有行情无关
-        if(frequency == "1d" && !isNull(conTbl)) {
+        if(frequency == "1d") {
             grid = rqContractGrid(instX, string(batch), tradeDates)
             conT = rqBuildContract(grid, rqLimitTable(raw), prev, dom)
             if(conT.rows() > 0) {
