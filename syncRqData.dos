@@ -1423,37 +1423,40 @@ def rqRegisterJob() {
     print("[RQ] 已注册定时任务 sync_futu_rqdata_daily（每日 17:00）")
     return true
 }
-
-/* ============================================================================
- * 附：迁移到其他 DolphinDB 实例的完整步骤（本段为注释，不参与执行）
- *
- * 前置条件
- *   - 目标服务器版本 ≥ 2.00.17（TSDB），验证环境为 3.00.6
- *   - 库名固定为 dfs://RQDATA.futu_*（路径写死在 rqLoad / rqInitDb 中，
- *     若要改名需同步改这两处，并把下面所有 rqInitDb 之后的调用一并适配）
- *   - 同一 License Key 不能两台机器同时拉取：RQData 重新取 token 会让旧 token
- *     立即失效，并发运行会导致双方反复 401。必须串行，或申请第二个 License
- *
- * 步骤
- *   1. 模块文件放到目标服务器的 <server>/modules/ 下：RQData.dos、syncRqData.dos
- *   2. 依赖插件
- *        installPlugin("httpClient"); loadPlugin("httpClient")
- *        use RQData
- *        use syncRqData
- *   3. 建库建表（幂等，可重复执行）
- *        syncRqData::rqInitDb()
- *   4. 交易日历（几十 KB，必须先跑：增量判断与预算预估都依赖它）
- *        syncRqData::rqFillCalendar("license", "<License Key>", 2010.01.01, today())
- *   5. 日线 + contract 快照（约 1.08 GB，40~60 分钟，17 个年段）
- *        syncRqData::rqBackfillAll("license", "<License Key>", 2010.01.01)
- *   6. 分钟线（按需；近 1 年约 9 GB / 6~7 小时，近 3 年约 27 GB）
- *        syncRqData::rqBackfillMinute("license", "<License Key>", 2025.11.01, today())
- *
- * 说明
- *   - 第 5、6 步均支持断点续跑：中断后重跑只补缺口，已写入数据不会重复拉取
- *   - 每段开始前自动查剩余配额，低于 2 GB 停止，避免跑一半断掉
- *   - 磁盘参考：bar 表 112 B/行（未压缩），TSDB 压缩 3~6 倍
- *       日线 + contract 全量 约 0.3~0.6 GB
- *       分钟线 近 1 年 约 3~5 GB；近 3 年 约 10~15 GB；2010 全量 约 45~70 GB
- *   - 迁移前建议先跑 rqPlanBackfill 拿目标环境的真实预算
- * ========================================================================== */
+// ============================================================================
+// 附：迁移到其他 DolphinDB 实例 —— 以下全部为注释，取消每行 // 即可执行
+// ----------------------------------------------------------------------------
+// 前置条件
+//   1. 目标服务器版本 >= 2.00.17（TSDB），验证环境 3.00.6
+//   2. 库名固定为 dfs://RQDATA.futu_*，写死在 rqLoad / rqInitDb 两处，改库名需同步修改
+//   3. 同一 License Key 不能两台机器同时拉取：RQData 重新取 token 会让旧 token 立即失效，
+//      并发运行会反复 401。必须串行，或申请第二个 License
+//   4. 把下面的 <License Key> 替换成真实 key
+// ----------------------------------------------------------------------------
+// 依赖插件与模块
+// installPlugin("httpClient"); loadPlugin("httpClient")
+// use RQData
+// use syncRqData
+//
+// 建库建表（幂等，可重复执行）
+// syncRqData::rqInitDb()
+//
+// 交易日历（几十 KB，必须先跑：增量判断与预算预估都依赖它）
+// syncRqData::rqFillCalendar("license", "<License Key>", 2010.01.01, today())
+//
+// 回补预算（不拉行情，只算缺口与额度，执行前建议先跑）
+// syncRqData::rqPlanBackfill("license", "<License Key>", 2010.01.01, today(), true)
+//
+// 日线 + contract 快照（约 1.08 GB，40~60 分钟，按年分 17 段）
+// syncRqData::rqBackfillAll("license", "<License Key>", 2010.01.01)
+//
+// 分钟线（按需；近 1 年约 9 GB / 6~7 小时，近 3 年约 27 GB）
+// syncRqData::rqBackfillMinute("license", "<License Key>", 2025.11.01, today())
+// ----------------------------------------------------------------------------
+// 说明
+//   - 日线、分钟线均支持断点续跑：中断后重跑只补缺口，已写入数据不会重复拉取
+//   - 每段开始前自动查剩余配额，低于 2 GB 停止，避免跑一半断掉
+//   - 磁盘参考：bar 表 112 B/行（未压缩），TSDB 压缩 3~6 倍
+//       日线 + contract 全量 约 0.3~0.6 GB
+//       分钟线 近 1 年 约 3~5 GB；近 3 年 约 10~15 GB；2010 全量 约 45~70 GB
+// ============================================================================
