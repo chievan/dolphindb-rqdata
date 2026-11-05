@@ -1,0 +1,500 @@
+module RQData
+
+/**
+ * RQData —— 米筐 RQData HTTP API 接入模块（DolphinDB）
+ *
+ * 依赖：httpClient 插件（installPlugin/loadPlugin，或在节点配置 preloadModules=plugins::httpClient）
+ * 加载：use RQData
+ *
+ * 认证与调用方式（官方 HTTP API）：
+ *   1) 取 token：POST https://rqdata.ricequant.com/auth
+ *      body: {"user_name":"xxx","password":"xxx"}
+ *        - 账号密码模式：返回 JSON {"token":"..."}
+ *        - 许可证模式：user_name 固定填 "license"，password 填 RQSDK 发放的 License Key，
+ *          返回的是裸 token 文本（不是 JSON），两种格式本模块都能识别
+ *      token 有效期 2 小时；重复获取会让旧 token 立即失效。
+ *   2) 取数据：POST https://rqdata.ricequant.com/api
+ *      header: {"token":"..."}，body 为 rqdatac 方法名 + 参数：
+ *      {"m":"get_price","order_book_ids":["AU2412"],...}
+ *      返回 CSV 文本，由本模块解析为 DolphinDB Table。
+ *
+ * 资产覆盖（当前 license 实测可用）：
+ *   - 期货：行情、合约清单/详情、主力合约、仓单、会员持仓排名
+ *   - 股票：行情、分红、复权因子、因子、行业、融资融券标的、沪股通/深股通、资金流、股份变动
+ *   - 指数：行情、成分股行业、涨跌幅
+ *   - 基金：名录与合约详情、场内行情（ETF 表现同股票）；净值类接口当前 license 不可用
+ *
+ * 关键注意点：
+ *   - Python API 里参数名若本身是 method，HTTP 请求要改写成 m（本模块已统一用 m）
+ *   - expect_df 参数会被服务端忽略，不要传
+ *   - 期货的 order_book_id 不带交易所后缀（如 AU2412，交易所看 exchange 列），
+ *     股票/指数/基金才带后缀（如 000001.XSHE、000300.XSHG、510300.XSHG）；
+ *     禁止硬编码，请用 all_instruments 返回的 order_book_id 建立映射
+ *   - 同一次 get_price 请求内所有 order_book_id 必须是同一资产类型，混资产会报
+ *     all order_book_ids should be in same type
+ *   - 所有返回列统一先按 STRING 读入，再由业务层显式转型，避免空串导致类型推断失败
+ *
+ * 对外函数：
+ *   —— 基础 ——
+ *   rqGetToken(user, pwd, force)
+ *   rqApi(token, params, timeout)
+ *   rqRequest(user, pwd, params, timeout)   —— 401 自动重登并重试一次
+ *   rqParseCsv(text)
+ *   rqCall(user, pwd, method, params, timeout)
+ *   —— 通用/行情 ——
+ *   rqGetPrice(user, pwd, rqIds, startDate, endDate, frequency, fields)
+ *   rqAllInstruments(user, pwd, typeName)
+ *   rqInstruments(user, pwd, rqIds)
+ *   rqTradingDates(user, pwd, startDate, endDate)
+ *   rqGetQuota(user, pwd)
+ *   rqGetPriceChangeRate(user, pwd, rqIds, startDate, endDate)
+ *   rqGetExFactor(user, pwd, rqIds, startDate, endDate)
+ *   rqGetDividend(user, pwd, rqIds, startDate, endDate)
+ *   rqGetFactor(user, pwd, rqIds, factors, startDate, endDate)
+ *   —— 期货 ——
+ *   rqFutContracts(user, pwd, underlyingSymbol)
+ *   rqFutDominant(user, pwd, underlyingSymbol, startDate, endDate)
+ *   rqFutWarehouseStocks(user, pwd, underlyingSymbols, startDate, endDate)
+ *   rqFutMemberRank(user, pwd, obj, startDate, endDate)
+ *   rqGetTickSize(user, pwd, rqIds)
+ *   rqFutTradingParams(user, pwd, rqIds, [startDate], [endDate])
+ *   rqFutDominantPrice(user, pwd, underlyingSymbols, startDate, endDate, [adjustType], [frequency], [fields])
+ *   —— 股票 ——
+ *   rqInstrumentIndustry(user, pwd, rqIds)
+ *   rqIndustryStocks(user, pwd, industryCode)
+ *   rqMarginStocks(user, pwd, tradeDate)
+ *   rqStockConnect(user, pwd, rqIds, startDate, endDate)
+ *   rqCapitalFlow(user, pwd, rqIds, startDate, endDate)
+ *   rqShareTransformation(user, pwd)
+ *
+ * 版本: 1.3.0
+ */
+
+// ============================================================================
+// 0. 模块信息
+// ============================================================================
+def module_info() {
+    /*
+     * 内部硬编码元数据，供 DolphinDB getLoadedModules() 系统函数提取
+     * 注意：此函数不应在测试脚本中被显式调用
+     */
+    res = dict(STRING, ANY)
+    res["moduleName"] = "RQData"
+    res["moduleVersion"] = "1.3.0"
+    res["isFree"] = true
+    res["description"] = "DolphinDB RQData Module (Futures/Stock/Index/Fund HTTP API Wrapper)"
+    return res
+}
+
+// ============================================================================
+// 1. 端点配置（用函数返回，避免模块级全局变量）
+// ============================================================================
+def rqEndpoint() {
+    d = dict(STRING, ANY)
+    d["auth"] = "https://rqdata.ricequant.com/auth"
+    d["api"] = "https://rqdata.ricequant.com/api"
+    return d
+}
+
+// ============================================================================
+// 2. token 缓存（共享表，跨会话可见；失败不影响主流程）
+// ============================================================================
+def rqTokenCache() {
+    t = NULL
+    try { t = objByName("rq_token_cache") } catch(ex) { t = NULL }
+    // 注意：isNull 不支持表对象，用 typestr 判断；typestr 返回大写 "VOID"，比较需区分大小写
+    if(typestr(t) == "VOID") {
+        t = table(1:0, `user_id`tk`fetch_time, [STRING, STRING, DATETIME])
+        try { share(t, "rq_token_cache") } catch(ex) { }
+        try { t = objByName("rq_token_cache") } catch(ex) { }
+    }
+    return t
+}
+
+def rqTokenRead(uid) {
+    t = rqTokenCache()
+    r = select tk, fetch_time from t where user_id == uid order by fetch_time desc limit 1
+    if(r.rows() == 0) return ""
+    // token 有效期 2 小时，这里 90 分钟就提前换新，避免临界失效
+    if(r.fetch_time[0] < datetime(now()) - 5400) return ""
+    return r.tk[0]
+}
+
+def rqTokenWrite(uid, tok) {
+    t = rqTokenCache()
+    // 共享内存表不支持 sqlDelete，必须用 delete from 语句（结尾分号不可省）
+    try { delete from t where user_id == uid; } catch(ex) { }
+    try { t.append!(table([uid] as user_id, [tok] as tk, [datetime(now())] as fetch_time)) } catch(ex) { }
+    return true
+}
+
+// ============================================================================
+// 3. 取 token
+// ============================================================================
+def rqGetToken(uid, pwd, force=false) {
+    if(!force) {
+        cached = rqTokenRead(uid)
+        if(cached != "") return cached
+    }
+
+    try { loadPlugin("httpClient") } catch(ex) { }
+    ep = rqEndpoint()
+    body = toStdJson(dict(["user_name", "password"], [uid, pwd]))
+    headers = dict(["Content-Type"], ["application/json"])
+
+    resp = httpClient::httpPost(ep["auth"], body, 30000, headers)
+    code = resp["responseCode"]
+    if(code != 200) throw "RQData 认证失败(" + string(code) + "): " + string(resp["text"])
+
+    // 两种认证模式的响应不同：
+    //   账号密码 -> JSON {"token":"..."}
+    //   许可证   -> 裸 token 文本（uid = "license"，pwd = License Key）
+    txt = trim(string(resp["text"]))
+    tok = ""
+    if(strlen(txt) > 0 && substr(txt, 0, 1) == "{") {
+        js = NULL
+        try { js = fromStdJson(txt) } catch(ex) {
+            throw "RQData 认证响应不是合法 JSON: " + txt
+        }
+        tok = string(js["token"])
+    } else {
+        tok = txt
+    }
+    if(tok == "") throw "RQData 认证成功但未返回 token"
+
+    rqTokenWrite(uid, tok)
+    return tok
+}
+
+// ============================================================================
+// 4. 通用 api 调用（返回原始响应字典：responseCode / text / headers）
+// ============================================================================
+def rqApi(token, params, timeout=180000) {
+    try { loadPlugin("httpClient") } catch(ex) { }
+    ep = rqEndpoint()
+    body = toStdJson(params)
+    headers = dict(["token", "Content-Type"], [token, "application/json"])
+    return httpClient::httpPost(ep["api"], body, timeout, headers)
+}
+
+// ============================================================================
+// 5. 带自动重登的请求：401/403 时强制换 token 再试一次
+// ============================================================================
+def rqRequest(uid, pwd, params, timeout=180000) {
+    token = rqGetToken(uid, pwd, false)
+    resp = rqApi(token, params, timeout)
+    code = resp["responseCode"]
+    if(code == 401 || code == 403) {
+        token = rqGetToken(uid, pwd, true)
+        resp = rqApi(token, params, timeout)
+        code = resp["responseCode"]
+    }
+    return resp
+}
+
+// ============================================================================
+// 6. CSV -> Table
+//    统一按 STRING 读入；列名取 CSV 表头（首个列名可能为空，自动补 rq_col_0）
+//    loadText 只接受文件，这里落一个临时文件后立即删除（文件名用随机 UUID，并发安全）
+// ============================================================================
+def rqParseCsv(text) {
+    s = string(text)
+    if(strlen(s) == 0) return table(1:0, [`rq_col_0], [STRING])
+
+    // 表头
+    pos = strpos(s, "\n")
+    header = iif(pos < 0, s, substr(s, 0, pos))
+    header = strReplace(header, "\r", "")
+    if(strlen(header) == 0) return table(1:0, [`rq_col_0], [STRING])
+
+    rawNames = split(header, ",")
+    n = rawNames.size()
+    names = array(STRING, 0)
+    for(i in 0:n) {
+        nm = strReplace(trim(rawNames[i]), "\"", "")
+        if(nm == "") nm = "rq_col_" + string(i)
+        // 去重，避免 loadText 报重复列名
+        while(nm in names) { nm = nm + "_" + string(i) }
+        names.append!(nm)
+    }
+
+    schema = table(names as name, take("STRING", n) as type)
+    // 临时文件名必须每次唯一：并发（ploop）时若按内容 md5 命名，相同响应会命中同一文件，
+    // 先完成的线程 rm 后，其他线程的 loadText 就会报 "file doesn't exist"
+    tmp = getHomeDir() + "/rq_tmp_" + string(rand(uuid(), 1)[0]) + ".csv"
+    saveTextFile(s, tmp)
+    res = NULL
+    try {
+        res = loadText(tmp, schema=schema, containHeader=true)
+    } catch(ex) {
+        try { rm(tmp) } catch(e2) { }
+        throw "RQData CSV 解析失败: " + ex[1]
+    }
+    try { rm(tmp) } catch(ex) { }
+    return res
+}
+
+// ============================================================================
+// 7. 统一调用助手：拼方法名与参数 -> 请求 -> 校验状态码 -> 解析 CSV
+//    所有业务接口都走这里，便于统一错误信息与后续扩展
+// ============================================================================
+def rqCall(uid, pwd, method, params=NULL, timeout=180000) {
+    p = dict(STRING, ANY)
+    p["m"] = method
+    if(!isVoid(params)) {
+        for(k in params.keys()) { p[k] = params[k] }
+    }
+
+    resp = rqRequest(uid, pwd, p, timeout)
+    code = resp["responseCode"]
+    if(code != 200) throw "RQData " + method + " 失败(" + string(code) + "): " + string(resp["text"])
+    return rqParseCsv(resp["text"])
+}
+
+// ============================================================================
+// 8. 参数与字段助手
+// ============================================================================
+
+// 日期 -> yyyyMMdd 整数（RQData HTTP 接口统一用整数日期）
+// 必填日期传 NULL 时直接报错：否则序列化成 JSON null，服务端会当成“未指定”，
+// 静默返回全历史（如 get_ex_factor）或最新快照（如 get_margin_stocks），容易误用
+def rqDateInt(d) {
+    if(isVoid(d)) throw "RQData 日期参数不能为空"
+    return int(temporalFormat(date(d), "yyyyMMdd"))
+}
+
+// 判断是否为期货代码：期货 order_book_id 不带交易所后缀，其余品种带 "."（如 000001.XSHE）
+def rqIsFutureIds(rqIds) {
+    ids = string(rqIds)
+    return !any(ids like "%.%")
+}
+
+// 按资产类型 + 频率生成默认行情字段
+def rqDefaultFields(frequency, isFuture) {
+    intraday = string(frequency) != "1d"
+    flds = ["open", "high", "low", "close", "volume", "total_turnover"]
+    if(isFuture) flds.append!("open_interest")
+    if(intraday) {
+        // 分钟线不支持 settlement/prev_settlement/limit_up/limit_down；
+        // 期货分钟线额外返回 trading_date（股票/指数/基金分钟线没有该列）
+        if(isFuture) flds.append!("trading_date")
+    } else {
+        if(isFuture) {
+            flds.append!(["settlement", "prev_settlement", "limit_up", "limit_down"])
+        } else {
+            // 股票/指数/基金日线通用字段
+            flds.append!("prev_close")
+        }
+    }
+    return flds
+}
+
+// ============================================================================
+// 9. 日线 / 分钟线（期货、股票、指数、基金通用，但同一次请求不能混资产）
+// ============================================================================
+def rqGetPrice(uid, pwd, rqIds, startDate, endDate, frequency="1d", fields=NULL) {
+    flds = fields
+    if(isVoid(fields)) flds = rqDefaultFields(frequency, rqIsFutureIds(rqIds))
+
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    p["frequency"] = frequency
+    p["adjust_type"] = "none"
+    p["fields"] = flds
+    return rqCall(uid, pwd, "get_price", p)
+}
+
+// ============================================================================
+// 10. 全量合约清单（含已退市合约；type 支持 Future / Stock / Index / Fund / ETF 等）
+// ============================================================================
+def rqAllInstruments(uid, pwd, typeName="Future") {
+    p = dict(STRING, ANY)
+    p["type"] = typeName
+    // 注意：不能传 date。传了 date 只返回该日仍在交易的合约（含历史退市合约会被过滤掉），
+    // 例如 AU2412 已于 2024-12 退市，传 date=today 后就查不到
+    return rqCall(uid, pwd, "all_instruments", p)
+}
+
+// ============================================================================
+// 11. 合约详情（可一次传多个，支持混资产；不同资产返回列不同）
+// ============================================================================
+def rqInstruments(uid, pwd, rqIds) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    return rqCall(uid, pwd, "instruments", p)
+}
+
+// ============================================================================
+// 12. 交易日历
+// ============================================================================
+def rqTradingDates(uid, pwd, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "get_trading_dates", p)
+}
+
+// ============================================================================
+// 13. 配额查询（返回 name/value 两列：bytes_used、bytes_limit、remaining_days、license_type）
+// ============================================================================
+def rqGetQuota(uid, pwd) {
+    return rqCall(uid, pwd, "user.get_quota", NULL)
+}
+
+// ============================================================================
+// 14. 行情衍生数据（股票/指数/基金，期货部分字段不适用）
+// ============================================================================
+
+// 区间涨跌幅：宽表返回，date + 每个 order_book_id 一列
+def rqGetPriceChangeRate(uid, pwd, rqIds, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "get_price_change_rate", p)
+}
+
+// 复权因子
+def rqGetExFactor(uid, pwd, rqIds, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "get_ex_factor", p)
+}
+
+// 分红送股
+def rqGetDividend(uid, pwd, rqIds, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "get_dividend", p)
+}
+
+// 因子数据（factors 可传单个字符串或字符串向量）
+def rqGetFactor(uid, pwd, rqIds, factors, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    p["factor"] = factors
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "get_factor", p)
+}
+
+// ============================================================================
+// 15. 期货专项
+// ============================================================================
+
+// 某品种当前挂牌合约（underlying_symbol 为单数，如 "AU"；返回单列 order_book_id，未排序）
+def rqFutContracts(uid, pwd, underlyingSymbol) {
+    p = dict(STRING, ANY)
+    p["underlying_symbol"] = underlyingSymbol
+    return rqCall(uid, pwd, "futures.get_contracts", p)
+}
+
+// 主力合约（返回 date, dominant；注意不是主力连续合约价格）
+def rqFutDominant(uid, pwd, underlyingSymbol, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["underlying_symbol"] = underlyingSymbol
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "futures.get_dominant", p)
+}
+
+// 仓单数据（underlying_symbols 为复数向量，如 ["AU","RB"]；日期可选，不传返回全部）
+def rqFutWarehouseStocks(uid, pwd, underlyingSymbols, startDate=NULL, endDate=NULL) {
+    p = dict(STRING, ANY)
+    p["underlying_symbols"] = underlyingSymbols
+    if(!isVoid(startDate)) p["start_date"] = rqDateInt(startDate)
+    if(!isVoid(endDate)) p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "futures.get_warehouse_stocks", p)
+}
+
+// 会员持仓排名（obj 为品种代码，如 "AU"）
+def rqFutMemberRank(uid, pwd, obj, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["obj"] = obj
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "futures.get_member_rank", p)
+}
+
+// 最小变动价位（返回 order_book_id, tick_size；对应 RQData Instrument.tick_size()）
+def rqGetTickSize(uid, pwd, rqIds) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    return rqCall(uid, pwd, "get_tick_size", p)
+}
+
+// 期货交易参数（手续费/保证金率/限仓/下单量）；日期可选，不传返回当日快照
+def rqFutTradingParams(uid, pwd, rqIds, startDate=NULL, endDate=NULL) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    if(!isVoid(startDate)) p["start_date"] = rqDateInt(startDate)
+    if(!isVoid(endDate)) p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "futures.get_trading_parameters", p)
+}
+
+// 主力连续行情（复权口径 adjustType: none/pre/post），额外返回 dominant_id
+def rqFutDominantPrice(uid, pwd, underlyingSymbols, startDate, endDate, adjustType="none",
+                       frequency="1d", fields=NULL) {
+    p = dict(STRING, ANY)
+    p["underlying_symbols"] = underlyingSymbols
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    p["adjust_type"] = adjustType
+    p["frequency"] = frequency
+    if(!isVoid(fields)) p["fields"] = fields
+    return rqCall(uid, pwd, "futures.get_dominant_price", p)
+}
+
+// ============================================================================
+// 16. 股票专项
+// ============================================================================
+
+// 个股所属一级行业
+def rqInstrumentIndustry(uid, pwd, rqIds) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    return rqCall(uid, pwd, "get_instrument_industry", p)
+}
+
+// 行业内股票列表（industryCode 为行业代码，如 "40"；传行业名称会返回空表）
+def rqIndustryStocks(uid, pwd, industryCode) {
+    p = dict(STRING, ANY)
+    p["industry"] = industryCode
+    return rqCall(uid, pwd, "get_industry", p)
+}
+
+// 某日融资融券标的（单列 order_book_id）
+def rqMarginStocks(uid, pwd, tradeDate) {
+    p = dict(STRING, ANY)
+    p["date"] = rqDateInt(tradeDate)
+    return rqCall(uid, pwd, "get_margin_stocks", p)
+}
+
+// 沪股通/深股通持股比例
+def rqStockConnect(uid, pwd, rqIds, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "get_stock_connect", p)
+}
+
+// 资金流（buy_value/buy_volume/sell_value/sell_volume）
+def rqCapitalFlow(uid, pwd, rqIds, startDate, endDate) {
+    p = dict(STRING, ANY)
+    p["order_book_ids"] = rqIds
+    p["start_date"] = rqDateInt(startDate)
+    p["end_date"] = rqDateInt(endDate)
+    return rqCall(uid, pwd, "get_capital_flow", p)
+}
+
+// 股份变动（换股、合并等事件，无必填参数）
+def rqShareTransformation(uid, pwd) {
+    return rqCall(uid, pwd, "get_share_transformation", NULL)
+}

@@ -1,0 +1,34 @@
+# ---------- 系统与编辑器 ----------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---------- DolphinDB 运行产物 ----------
+# token / 凭证 / 日志等本地运行文件，一律不入库
+*.log
+logs/
+rq_tmp_*.csv
+rq_token_cache*
+
+# ---------- Python（仅本地调试脚本可能用到） ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---------- 敏感信息 ----------
+# 账号密码请用 syncRqData::rqSetCred / 环境变量，禁止提交到仓库
+.env
+.env.*
+*credential*
+*secret*
+rq_key*.txt
+
+# ---------- 本地临时脚本 ----------
+# 含其他系统凭证（如 Obsidian 本地 API token），不入库
+tt.dos

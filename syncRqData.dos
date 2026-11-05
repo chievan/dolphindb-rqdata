@@ -1,0 +1,829 @@
+module syncRqData
+
+/**
+ * syncRqData —— RQData 全市场期货数据同步（DolphinDB）
+ *
+ * 加载：先 use RQData，再 use syncRqData
+ *
+ * 目标库（每张表一个独立 database，表名统一为 data；首次使用先执行 rqInitDb() 建库建表）：
+ *   dfs://FUTU_bar.data           日线/分钟线（19 列，TSDB，按 trade_date 月分区）
+ *   dfs://FUTU_contract.data      每日合约快照（17 列，TSDB，上市期间每个交易日一行，含无成交合约）
+ *   dfs://FUTU_calendar.data      交易日历
+ *   dfs://FUTU_synclog.data       同步日志
+ *
+ * 合约静态信息不单独建维表：contract 每个交易日都有一行完整快照，
+ * 取 max(trade_date) 那天即“当前合约池”；合约清单每次同步由 all_instruments 现取。
+ *
+ * 数据源字段映射（RQData -> FUTU）：
+ *   total_turnover -> turnover(元)   settlement -> settle
+ *   prev_settlement -> pre_settle    volume 单位：手
+ *   get_price 的 limit_up/limit_down -> contract 的涨跌停
+ *   all_instruments 的 contract_multiplier -> size，listed_date/de_listed_date -> list_date/last_date
+ *   all_instruments 的 margin_rate -> contract.margin_ratio，industry_name -> contract.industry
+ *
+ * 合约代码口径：
+ *   期货的 order_book_id 不带交易所后缀（AU2412），交易所取 all_instruments 的 exchange 列；
+ *   分钟线通过 get_price 的 trading_date 列把夜盘归属到下一交易日。
+ *
+ * 连续合约（all_instruments 中已包含，随正常合约一并同步）：
+ *   XX88  主力连续（不复权）      XX888 主力连续价差平滑（= 前复权）      XX99 指数连续
+ *   三者上市/退市日为 0000-00-00，按 NULL 处理（视为始终存续）；
+ *   contract 的 dominant_id 记录 88/888 当日对应的真实主力合约（取自 futures.get_dominant_price）。
+ *
+ * 暂未接入落库的字段（新合约继承同品种已有值）：
+ *   commission_num / commission_unit / max_order_vol / pricetick
+ *   （RQData 可经 get_tick_size、futures.get_trading_parameters 获取，接口已封装在 RQData 模块）
+ *
+ * 写入幂等：TSDB 表按 sortColumns 去重（同键后写覆盖），增量任务可安全重跑。
+ *
+ * 入口函数：
+ *   rqInitDb()                                       首次使用：建库建表（幂等）
+ *   rqSyncBars(user, pwd, startDate, endDate, freq, batchSize)
+ *                                                    区间回补/增量：freq 取 "1d"/"1m"/"5m"/"60m"
+ *   rqSyncCalendar(user, pwd, startDate, endDate)    补齐交易日历
+ *   rqFillPreSettle(user, pwd, startDate, endDate, freq, batchSize)
+ *                                                    历史回填分钟线的 pre_settle（幂等）
+ *   rqMinuteJob(lookback, frequency, batchSize)      分钟线每日增量（无参可调度）
+ *   rqDailyJob()                                     无参入口，供 scheduleJob 调用
+ *   rqBackfillAll(user, pwd, startDate)              全历史回补（日线）
+ *   rqRegisterJob()                                  注册每日 17:00 定时任务
+ *
+ * 版本: 1.5.0
+ */
+
+// ============================================================================
+// 0. 模块信息
+// ============================================================================
+def module_info() {
+    /*
+     * 内部硬编码元数据，供 DolphinDB getLoadedModules() 系统函数提取
+     * 注意：此函数不应在测试脚本中被显式调用
+     */
+    res = dict(STRING, ANY)
+    res["moduleName"] = "syncRqData"
+    res["moduleVersion"] = "1.5.0"
+    res["isFree"] = true
+    res["description"] = "DolphinDB syncRqData Module (Futures ETL via RQData)"
+    return res
+}
+
+// ============================================================================
+// 1. 表结构与载入
+// ============================================================================
+def rqLoad(name) {
+    return loadTable("dfs://FUTU_" + name, "data")
+}
+
+def rqEmptyBar() {
+    return table(1:0,
+        `trade_date`datetime`interval`series`exchange`variety`symbol`open`high`low`close`pre_settle`settle`volume`turnover`open_interest`next_symbol`src`update_time,
+        [DATE, NANOTIMESTAMP, SYMBOL, SYMBOL, SYMBOL, SYMBOL, SYMBOL,
+         DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE,
+         SYMBOL, SYMBOL, NANOTIMESTAMP])
+}
+
+def rqEmptyContract() {
+    return table(1:0,
+        `trade_date`symbol`dominant_id`exchange`variety`name`industry`size`pricetick`margin_ratio`commission_num`commission_unit`list_date`last_date`limit_up`limit_down`max_order_vol`update_time,
+        [DATE, SYMBOL, STRING, SYMBOL, SYMBOL, STRING, STRING, DOUBLE, DOUBLE, DOUBLE, DOUBLE, SYMBOL,
+         DATE, DATE, DOUBLE, DOUBLE, DOUBLE, NANOTIMESTAMP])
+}
+
+def rqEmptyCalendar() {
+    return table(1:0, `trade_date`exchange`update_time, [DATE, SYMBOL, NANOTIMESTAMP])
+}
+
+def rqEmptySyncLog() {
+    return table(1:0,
+        `job_name`data_type`exchange`interval`start_date`end_date`row_count`status`message`update_time,
+        [STRING, STRING, STRING, STRING, DATE, DATE, LONG, STRING, STRING, NANOTIMESTAMP])
+}
+
+// ============================================================================
+// 1.1 建库建表（首次使用执行一次，重复执行无副作用）
+//     bar/contract 按 trade_date 月分区；分钟线与日线共用 bar 表，用 interval 区分
+// ============================================================================
+def rqInitDb() {
+    if(!existsDatabase("dfs://FUTU_bar")) {
+        dbBar = database("dfs://FUTU_bar", VALUE, 2010.01M..2030.12M, engine="TSDB")
+        // keepDuplicates=LAST：同 (symbol, interval, datetime) 后写覆盖，增量任务重跑幂等
+        // 必须带 interval：日线落在 15:00，与最后一根 1 分钟线时间戳相同，不带 interval 会互相覆盖
+        dbBar.createPartitionedTable(table=rqEmptyBar(), tableName="data",
+            partitionColumns=`trade_date, sortColumns=`symbol`interval`datetime, keepDuplicates="LAST")
+    }
+    if(!existsDatabase("dfs://FUTU_contract")) {
+        dbCon = database("dfs://FUTU_contract", VALUE, 2010.01M..2030.12M, engine="TSDB")
+        dbCon.createPartitionedTable(table=rqEmptyContract(), tableName="data",
+            partitionColumns=`trade_date, sortColumns=`symbol`trade_date, keepDuplicates="LAST")
+    }
+    if(!existsDatabase("dfs://FUTU_calendar")) {
+        dbCal = database("dfs://FUTU_calendar", VALUE, 2010.01M..2030.12M)
+        dbCal.createPartitionedTable(table=rqEmptyCalendar(), tableName="data", partitionColumns=`trade_date)
+    }
+    if(!existsDatabase("dfs://FUTU_synclog")) {
+        dbLog = database("dfs://FUTU_synclog", VALUE, 2010.01M..2030.12M)
+        dbLog.createPartitionedTable(table=rqEmptySyncLog(), tableName="data", partitionColumns=`start_date)
+    }
+    print("[RQ] 建库建表完成（FUTU_bar / FUTU_contract / FUTU_calendar / FUTU_synclog）")
+    return true
+}
+
+// ============================================================================
+// 2. 字段转换助手
+// ============================================================================
+def rqCol(t, nm, n) {
+    // 取列；不存在则返回 n 个空串（后续转数值自动变 NULL）
+    if(nm in t.columnNames()) return t[nm]
+    return take("", n)
+}
+
+def rqToDouble(v) {
+    // 空串 / nan / None / NaT 一律按 NULL 处理
+    s = trim(string(v))
+    s = iif(lower(s) == "nan", "", s)
+    s = iif(lower(s) == "none", "", s)
+    s = iif(lower(s) == "nat", "", s)
+    return double(s)
+}
+
+def rqToDate(v) {
+    s = trim(string(v))
+    // 兼容 "yyyy-MM-dd" 与 "yyyy-MM-dd HH:mm:ss"（分钟线 trading_date 返回的是后者）
+    if(strlen(s) > 10) s = substr(s, 0, 10)
+    // 连续合约（88/888/99）的上市/退市日返回 0000-00-00，按 NULL 处理（视为始终存续）
+    s = iif(s == "0000-00-00", "", s)
+    return temporalParse(s, "yyyy-MM-dd")
+}
+
+// ============================================================================
+// 3. 运行参数（账号密码存共享表，避免硬编码到定时任务函数里）
+// ============================================================================
+def rqConfigTable() {
+    t = NULL
+    try { t = objByName("rq_config") } catch(ex) { t = NULL }
+    // 注意：isNull 不支持表对象，用 typestr 判断；typestr 返回大写 "VOID"，比较需区分大小写
+    if(typestr(t) == "VOID") {
+        t = table(1:0, `cfg_key`value, [STRING, STRING])
+        try { share(t, "rq_config") } catch(ex) { }
+        try { t = objByName("rq_config") } catch(ex) { }
+    }
+    return t
+}
+
+def rqSetCred(user, pwd) {
+    t = rqConfigTable()
+    // 共享内存表不支持 sqlDelete，必须用 delete from 语句（结尾分号不可省）
+    try { delete from t where cfg_key in ["user", "pwd"]; } catch(ex) { }
+    t.append!(table(["user", "pwd"] as cfg_key, [user, pwd] as value))
+    print("[RQ] RQData 账号已写入共享表 rq_config")
+    return true
+}
+
+def rqGetCred(key) {
+    t = rqConfigTable()
+    r = select value from t where cfg_key == key
+    if(r.rows() == 0) return ""
+    return r.value[0]
+}
+
+// ============================================================================
+// 4. 同步日志
+// ============================================================================
+def rqLog(jobName, dataType, exchange, interval, startDate, endDate, rowCount, status, message) {
+    try {
+        t = rqLoad("synclog")
+        t.append!(table([jobName] as job_name, [dataType] as data_type, [exchange] as exchange,
+            [interval] as interval, [startDate] as start_date, [endDate] as end_date,
+            [long(rowCount)] as row_count, [status] as status, [message] as message,
+            [nanotimestamp(now())] as update_time))
+    } catch(ex) {
+        print("[RQ] 写 synclog 失败: " + ex[1])
+    }
+    return true
+}
+
+// ============================================================================
+// 5. 全量合约清单 -> 标准中间表
+//    rq_id / symbol / exchange / variety / name / size / list_date / last_date
+// ============================================================================
+def rqFetchInstruments(user, pwd) {
+    raw = RQData::rqAllInstruments(user, pwd, "Future")
+    n = raw.rows()
+    empty = table(1:0, `rq_id`symbol`exchange`variety`name`size`list_date`last_date`margin_ratio`industry,
+        [STRING, STRING, STRING, STRING, STRING, DOUBLE, DATE, DATE, DOUBLE, STRING])
+    if(n == 0) return empty
+    cols = raw.columnNames()
+    if(!("order_book_id" in cols)) return empty
+
+    ids = trim(string(raw["order_book_id"]))
+    syms = regexReplace(ids, "\\..*", "")
+    ex = array(STRING, n)
+    if("exchange" in cols) ex = trim(string(raw["exchange"]))
+    nm = array(STRING, n)
+    // all_instruments 期货没有 name 列，中文简称在 symbol 列（如 "沪深 1005"）
+    if("name" in cols) nm = string(raw["name"])
+    else if("symbol" in cols) nm = trim(string(raw["symbol"]))
+    sizeV = take(double(NULL), n)
+    if("contract_multiplier" in cols) sizeV = rqToDouble(raw["contract_multiplier"])
+    lsd = take(date(NULL), n)
+    if("listed_date" in cols) lsd = rqToDate(raw["listed_date"])
+    ltd = take(date(NULL), n)
+    if("de_listed_date" in cols) ltd = rqToDate(raw["de_listed_date"])
+    mr = take(double(NULL), n)
+    if("margin_rate" in cols) mr = rqToDouble(raw["margin_rate"])
+    ind = take("", n)
+    if("industry_name" in cols) ind = trim(string(raw["industry_name"]))
+
+    return table(ids as rq_id, syms as symbol, ex as exchange,
+        regexReplace(syms, "[0-9]+", "") as variety, nm as name, sizeV as size,
+        lsd as list_date, ltd as last_date, mr as margin_ratio, ind as industry)
+}
+
+// ============================================================================
+// 6. 静态字段继承（RQData 不提供 pricetick / commission_num / 限仓）
+//    prev = startDate 之前最近一份 contract 快照，用于按“同合约 -> 同品种”回退
+// ============================================================================
+def rqPrevSnapshot(startDate) {
+    empty = table(1:0,
+        `symbol`margin_ratio`max_order_vol`commission_unit`pricetick`commission_num,
+        [SYMBOL, DOUBLE, DOUBLE, STRING, DOUBLE, DOUBLE])
+    if(!existsTable("dfs://FUTU_contract", "data")) return empty
+    con = rqLoad("contract")
+    lastD = exec max(trade_date) from con where trade_date < startDate
+    if(isNull(lastD)) return empty
+    return select last(margin_ratio) as margin_ratio, last(max_order_vol) as max_order_vol,
+                  last(commission_unit) as commission_unit, last(pricetick) as pricetick,
+                  last(commission_num) as commission_num
+           from con where trade_date == lastD group by symbol
+}
+
+def rqEnrichInstruments(inst, prev) {
+    n = inst.rows()
+    pt = take(double(NULL), n)
+    cn = take(double(NULL), n)
+    if(n > 0 && prev.rows() > 0) {
+        pk = string(prev.symbol)
+        pt = dict(pk, prev.pricetick)[string(inst.symbol)]
+        cn = dict(pk, prev.commission_num)[string(inst.symbol)]
+        // 新合约还没有自己的快照时，沿用同品种最近一份
+        if(sum(isNull(pt) or isNull(cn)) > 0) {
+            pvar = dict(string(inst.symbol), inst.variety)[pk]
+            pv = select variety, pricetick, commission_num
+                 from table(pvar as variety, prev.pricetick as pricetick, prev.commission_num as commission_num)
+                 where !isNull(variety)
+            if(pv.rows() > 0) {
+                vt = select last(pricetick) as pricetick, last(commission_num) as commission_num
+                     from pv group by variety
+                vpt = dict(string(vt.variety), vt.pricetick)[string(inst.variety)]
+                vcn = dict(string(vt.variety), vt.commission_num)[string(inst.variety)]
+                pt = iif(isNull(pt), vpt, pt)
+                cn = iif(isNull(cn), vcn, cn)
+            }
+        }
+    }
+    return table(inst.rq_id as rq_id, inst.symbol as symbol, inst.exchange as exchange,
+        inst.variety as variety, inst.name as name, inst.industry as industry, inst.size as size,
+        inst.list_date as list_date, inst.last_date as last_date, inst.margin_ratio as margin_ratio,
+        pt as pricetick, cn as commission_num)
+}
+
+// ============================================================================
+// 7. RQData 原始 CSV 表 -> FUTU.bar 行
+//    列必须严格按 FUTU.bar 顺序输出
+// ============================================================================
+def rqBuildBar(raw, inst, interval, src) {
+    n = raw.rows()
+    if(n == 0) return rqEmptyBar()
+    cols = raw.columnNames()
+    if(!("order_book_id" in cols)) return rqEmptyBar()
+
+    ids = trim(string(raw["order_book_id"]))
+    syms = regexReplace(ids, "\\..*", "")
+
+    // 先转成内存表，DFS 表不支持直接按列名取值
+    // 注意：inst 里 symbol 是 SYMBOL，这里按 STRING 建字典，才能用 RQData 返回的 STRING 代码查
+    ex = take("UNKNOWN", n)
+    var = regexReplace(syms, "[0-9]+", "")
+    if(inst.rows() > 0) {
+        m = select symbol, exchange, variety from inst
+        ex = string(dict(string(m.symbol), m.exchange)[syms])
+        var = string(dict(string(m.symbol), m.variety)[syms])
+        ex = iif(ex == "", "UNKNOWN", ex)
+        var = iif(var == "", regexReplace(syms, "[0-9]+", ""), var)
+    }
+
+    // 交易日期：日线用 date，分钟线用 trading_date
+    tradeDate = take(date(NULL), n)
+    if("date" in cols) {
+        tradeDate = rqToDate(raw["date"])
+    } else if("trading_date" in cols) {
+        tradeDate = rqToDate(raw["trading_date"])
+    }
+
+    // 时间戳：日线返回值只有日期（yyyy-MM-dd），分钟线是 yyyy-MM-dd HH:mm:ss
+    dt = array(NANOTIMESTAMP, n)
+    if("datetime" in cols) {
+        ds = trim(string(raw["datetime"]))
+        dt = nanotimestamp(temporalParse(ds, "yyyy-MM-dd HH:mm:ss"))
+        // 日线按上面的格式解析为 NULL，用纯日期格式补到 15:00
+        dtDay = nanotimestamp(concatDateTime(temporalParse(ds, "yyyy-MM-dd"), 15:00:00.000))
+        dt = iif(isNull(dt), dtDay, dt)
+    } else {
+        dt = nanotimestamp(concatDateTime(tradeDate, 15:00:00.000))
+    }
+    // 缺交易日的行（日线无 date / 分钟线未返回 trading_date）用 datetime 兜底
+    tradeDate = iif(isNull(tradeDate), date(dt), tradeDate)
+
+    return table(
+        tradeDate as trade_date,
+        dt as datetime,
+        symbol(take(interval, n)) as interval,
+        symbol(take("C", n)) as series,
+        symbol(ex) as exchange,
+        symbol(var) as variety,
+        symbol(syms) as symbol,
+        rqToDouble(rqCol(raw, "open", n)) as open,
+        rqToDouble(rqCol(raw, "high", n)) as high,
+        rqToDouble(rqCol(raw, "low", n)) as low,
+        rqToDouble(rqCol(raw, "close", n)) as close,
+        rqToDouble(rqCol(raw, "prev_settlement", n)) as pre_settle,
+        rqToDouble(rqCol(raw, "settlement", n)) as settle,
+        rqToDouble(rqCol(raw, "volume", n)) as volume,
+        rqToDouble(rqCol(raw, "total_turnover", n)) as turnover,
+        rqToDouble(rqCol(raw, "open_interest", n)) as open_interest,
+        array(SYMBOL, n) as next_symbol,
+        symbol(take(src, n)) as src,
+        take(nanotimestamp(now()), n) as update_time)
+}
+
+// ============================================================================
+// 8. contract 每日快照：上市期间每个交易日一行（含当日无成交的合约）
+//    网格 = 交易日 × 上市合约；涨跌停取当日行情，静态字段取 all_instruments
+// ============================================================================
+
+// 区间内的交易日：优先用库内日历，缺失时直接问 RQData，最后退化为自然日
+def rqRangeDates(user, pwd, startDate, endDate) {
+    d = array(DATE, 0)
+    if(existsTable("dfs://FUTU_calendar", "data")) {
+        try {
+            cal = rqLoad("calendar")
+            d = exec trade_date from cal where trade_date >= startDate, trade_date <= endDate
+        } catch(ex) { d = array(DATE, 0) }
+    }
+    // 库内日历没覆盖到该区间时走接口
+    if(d.size() == 0 || min(d) > startDate || max(d) < endDate) {
+        try {
+            raw = RQData::rqTradingDates(user, pwd, startDate, endDate)
+            if(raw.rows() > 0 && raw.columns() > 0) {
+                d = rqToDate(raw[raw.columnNames()[0]])
+                d = d[!isNull(d)]
+            }
+        } catch(ex) { print("[RQ] 取交易日历失败: " + ex[1]) }
+    }
+    // 兜底：按自然日（周末也会生成 contract 行）
+    if(d.size() == 0) d = startDate + (0..(endDate - startDate))
+    return sort(d)
+}
+
+// 交易日 × 上市合约 的笛卡尔网格，过滤上市日/退市日
+def rqContractGrid(inst, syms, dates) {
+    empty = table(1:0,
+        `trade_date`symbol`exchange`variety`name`industry`size`pricetick`commission_num`list_date`last_date`margin_ratio,
+        [DATE, SYMBOL, SYMBOL, SYMBOL, STRING, STRING, DOUBLE, DOUBLE, DOUBLE, DATE, DATE, DOUBLE])
+    if(inst.rows() == 0 || syms.size() == 0 || dates.size() == 0) return empty
+
+    m = select symbol, exchange, variety, name, industry, size, pricetick, commission_num,
+               list_date, last_date, margin_ratio
+        from inst where symbol in symbol(syms)
+    if(m.rows() == 0) return empty
+
+    dT = table(dates as trade_date)
+    return select trade_date, symbol, exchange, variety, name, industry, size, pricetick,
+                  commission_num, list_date, last_date, margin_ratio
+           from cj(dT, m)
+           where (isNull(list_date) or list_date <= trade_date)
+             and (isNull(last_date) or last_date >= trade_date)
+}
+
+// 当日行情的涨跌停：(symbol, trade_date) -> limit_up / limit_down
+def rqLimitTable(raw) {
+    empty = table(1:0, `symbol`trade_date`limit_up`limit_down, [SYMBOL, DATE, DOUBLE, DOUBLE])
+    if(typestr(raw) == "VOID") return empty
+    n = raw.rows()
+    if(n == 0) return empty
+    cols = raw.columnNames()
+    if(!("order_book_id" in cols)) return empty
+
+    syms = regexReplace(trim(string(raw["order_book_id"])), "\\..*", "")
+    d = take(date(NULL), n)
+    if("date" in cols) d = rqToDate(raw["date"])
+    else if("trading_date" in cols) d = rqToDate(raw["trading_date"])
+    else if("datetime" in cols) d = rqToDate(raw["datetime"])
+
+    t = table(symbol(syms) as symbol, d as trade_date,
+        rqToDouble(rqCol(raw, "limit_up", n)) as limit_up,
+        rqToDouble(rqCol(raw, "limit_down", n)) as limit_down)
+    return select last(limit_up) as limit_up, last(limit_down) as limit_down
+           from t group by symbol, trade_date
+}
+
+// 主力连续（88/888）每日对应的真实主力合约：(品种, 交易日) -> dominant_id
+def rqDominantIds(user, pwd, varieties, startDate, endDate, batchSize=20) {
+    out = table(1:0, `variety`trade_date`dominant_id, [STRING, DATE, STRING])
+    vs = distinct(string(varieties))
+    vs = vs[vs != ""]
+    if(vs.size() == 0) return out
+
+    nBatch = int(ceil(vs.size() / double(batchSize)))
+    for(i in 0:nBatch) {
+        lo = i * batchSize
+        hi = min((i + 1) * batchSize, vs.size())
+        raw = NULL
+        try {
+            // dominant_id 不占 fields，固定返回；只取 close 减小响应体
+            raw = RQData::rqFutDominantPrice(user, pwd, vs[lo:hi], startDate, endDate, "none", "1d", ["close"])
+        } catch(ex) {
+            print("[RQ] 主力合约映射获取失败(" + vs[lo:hi][0] + " 起): " + ex[1])
+            continue
+        }
+        n = raw.rows()
+        if(n == 0) continue
+        cols = raw.columnNames()
+        if(!("dominant_id" in cols)) continue
+
+        var = take("", n)
+        if("underlying_symbol" in cols) var = trim(string(raw["underlying_symbol"]))
+        d = take(date(NULL), n)
+        if("date" in cols) d = rqToDate(raw["date"])
+        else if("datetime" in cols) d = rqToDate(raw["datetime"])
+        did = trim(string(raw["dominant_id"]))
+        t = select last(did) as dominant_id from table(var as variety, d as trade_date, did as dominant_id)
+            group by variety, trade_date
+        out = unionAll(out, t)
+    }
+    return out
+}
+
+def rqBuildContract(grid, lim, prev, dom) {
+    n = grid.rows()
+    if(n == 0) return rqEmptyContract()
+
+    syms = string(grid.symbol)
+    // 保证金率取 RQData 的 margin_rate，缺失时继承上一份快照
+    mr = grid.margin_ratio
+    mv = take(double(NULL), n)
+    cu = take("元", n)
+    if(prev.rows() > 0) {
+        pkey = string(prev.symbol)
+        mrPrev = dict(pkey, prev.margin_ratio)[syms]
+        mr = iif(isNull(mr), mrPrev, mr)
+        mv = dict(pkey, prev.max_order_vol)[syms]
+        cu = string(dict(pkey, prev.commission_unit)[syms])
+        cu = iif(cu == "", "元", cu)
+    }
+
+    // 涨跌停：当日有行情才有值（停牌/无成交留 NULL，但行仍然保留）
+    lu = take(double(NULL), n)
+    ld = take(double(NULL), n)
+    if(lim.rows() > 0) {
+        lk = string(lim.symbol) + "|" + temporalFormat(lim.trade_date, "yyyyMMdd")
+        gk = syms + "|" + temporalFormat(grid.trade_date, "yyyyMMdd")
+        lu = dict(lk, lim.limit_up)[gk]
+        ld = dict(lk, lim.limit_down)[gk]
+    }
+
+    // 连续合约（88/888）当日对应的真实主力合约；其余合约与 99 指数连续为空
+    did = take("", n)
+    if(dom.rows() > 0) {
+        dk = string(dom.variety) + "|" + temporalFormat(dom.trade_date, "yyyyMMdd")
+        gk2 = string(grid.variety) + "|" + temporalFormat(grid.trade_date, "yyyyMMdd")
+        did = string(dict(dk, dom.dominant_id)[gk2])
+        did = iif(isNull(did), "", did)
+    }
+    isCont = syms like "%88"
+    did = iif(isCont, did, "")
+
+    return table(
+        grid.trade_date as trade_date,
+        grid.symbol as symbol,
+        did as dominant_id,
+        grid.exchange as exchange,
+        grid.variety as variety,
+        grid.name as name,
+        grid.industry as industry,
+        grid.size as size,
+        grid.pricetick as pricetick,
+        mr as margin_ratio,
+        grid.commission_num as commission_num,
+        symbol(cu) as commission_unit,
+        grid.list_date as list_date,
+        grid.last_date as last_date,
+        lu as limit_up,
+        ld as limit_down,
+        mv as max_order_vol,
+        take(nanotimestamp(now()), n) as update_time)
+}
+
+// ============================================================================
+// 8.1 昨结算价映射：(合约|交易日) -> 昨结算
+//     RQData 的分钟线不返回 prev_settlement，用同一交易日的日线 prev_settlement 补齐
+//     返回 table(k STRING, v DOUBLE)，k 形如 "AU2412|20241008"，v 是该交易日的昨结算
+// ============================================================================
+def rqDailyPreSettle(user, pwd, symbols, startDate, endDate, batchSize=50) {
+    n = symbols.size()
+    if(n == 0) return table(1:0, `k`v, [STRING, DOUBLE])
+
+    ks = array(STRING, 0)
+    vs = array(DOUBLE, 0)
+    nBatch = int(ceil(n / double(batchSize)))
+    for(i in 0:nBatch) {
+        lo = i * batchSize
+        hi = min((i + 1) * batchSize, n)
+        raw = NULL
+        try {
+            raw = RQData::rqGetPrice(user, pwd, string(symbols[lo:hi]), startDate, endDate, "1d", ["prev_settlement"])
+        } catch(ex) {
+            print("[RQ] 取昨结算失败: " + ex[1])
+            continue
+        }
+        if(raw.rows() == 0) continue
+        cols = raw.columnNames()
+        if(!("prev_settlement" in cols) || !("datetime" in cols)) continue
+
+        ds = trim(string(raw["datetime"]))
+        dd = date(temporalParse(ds, "yyyy-MM-dd HH:mm:ss"))
+        dd = iif(isNull(dd), date(temporalParse(ds, "yyyy-MM-dd")), dd)
+        ks.append!(trim(string(raw["order_book_id"])) + "|" + temporalFormat(dd, "yyyyMMdd"))
+        vs.append!(rqToDouble(raw["prev_settlement"]))
+        sleep(50)
+    }
+    if(ks.size() == 0) return table(1:0, `k`v, [STRING, DOUBLE])
+
+    // 去重（同一合约同一交易日只保留一条），返回 (k, v) 两列表
+    return select last(v) as v from table(ks as k, vs as v) group by k
+}
+
+// ============================================================================
+// 9. 区间同步主流程批量拉取并落库
+//    frequency: "1d" / "1m" / "5m" / "60m"
+//    日线同时写 contract 快照；分钟线只写 bar
+// ============================================================================
+def rqSyncBars(user, pwd, startDate, endDate, frequency="1d", batchSize=50) {
+    if(startDate > endDate) return 0
+
+    inst = rqFetchInstruments(user, pwd)
+    if(inst.rows() == 0) {
+        print("[RQ] 合约清单为空，无法同步")
+        return 0
+    }
+    idMap = dict(inst.symbol, inst.rq_id)
+
+    // 上一份合约快照（用于继承 margin_ratio / pricetick / commission_num 等）
+    // 只取 startDate 之前最近的一份，避免历史回补时继承到“未来”的保证金率
+    prev = table(1:0, `symbol`margin_ratio`max_order_vol`commission_unit`pricetick`commission_num,
+        [SYMBOL, DOUBLE, DOUBLE, STRING, DOUBLE, DOUBLE])
+    if(frequency == "1d") prev = rqPrevSnapshot(startDate)
+    instX = rqEnrichInstruments(inst, prev)
+
+    // 候选合约：上市日 <= endDate 且 退市日 >= startDate
+    cand = select symbol from instX where (isNull(list_date) or list_date <= endDate)
+            and (isNull(last_date) or last_date >= startDate)
+    syms = cand.symbol
+    sz = syms.size()
+    if(sz == 0) return 0
+
+    // contract 是“上市期间每个交易日一行”，需要先拿到区间内的交易日
+    tradeDates = array(DATE, 0)
+    if(frequency == "1d") tradeDates = rqRangeDates(user, pwd, startDate, endDate)
+
+    // 连续合约（88/888）每日对应的真实主力合约
+    dom = table(1:0, `variety`trade_date`dominant_id, [STRING, DATE, STRING])
+    if(frequency == "1d") {
+        try { dom = rqDominantIds(user, pwd, exec distinct(variety) from inst, startDate, endDate) }
+        catch(ex) { print("[RQ] 主力合约映射获取失败，dominant_id 将留空: " + ex[1]) }
+    }
+
+    barTbl = rqLoad("bar")
+    conTbl = NULL
+    if(frequency == "1d") conTbl = rqLoad("contract")
+
+    // 分钟线 RQData 不返回昨结算，先用同日日线的 prev_settlement 建映射
+    preMap = NULL
+    if(frequency != "1d") {
+        try {
+            preT = rqDailyPreSettle(user, pwd, string(syms), startDate, endDate)
+            if(preT.rows() > 0) preMap = dict(preT.k, preT.v)
+        } catch(ex) { print("[RQ] 昨结算映射构建失败，pre_settle 将留空: " + ex[1]) }
+    }
+
+    nBatch = int(ceil(sz / double(batchSize)))
+    totalBar = 0
+    totalCon = 0
+    print("[RQ] 开始同步 frequency=" + frequency + " 合约数=" + string(sz) + " 批次=" + string(nBatch) +
+          " 区间=" + string(startDate) + "~" + string(endDate))
+
+    for(i in 0:nBatch) {
+        lo = i * batchSize
+        hi = min((i + 1) * batchSize, sz)
+        batch = syms[lo:hi]
+        // idMap 的键是 RQData 返回的 STRING 代码，cand.symbol 是 SYMBOL，需转换
+        ids = idMap[string(batch)]
+        ids = iif(isNull(ids), "", ids)
+        ids = ids[ids != ""]
+
+        raw = NULL
+        barT = rqEmptyBar()
+        if(ids.size() > 0) {
+            try {
+                raw = RQData::rqGetPrice(user, pwd, ids, startDate, endDate, frequency)
+            } catch(ex) {
+                print("[RQ] 批次 " + string(i) + " 拉取失败: " + ex[1])
+                rqLog("rqdata_sync", "bar", "ALL", frequency, startDate, endDate, 0, "FAILED", ex[1])
+                continue
+            }
+            if(raw.rows() == 0) {
+                print("[RQ] 批次 " + string(i) + " 无行情，仍生成 contract 行")
+            } else {
+                barT = rqBuildBar(raw, instX, frequency, "rqdata")
+                // 分钟线用日线的昨结算补齐 pre_settle（同一交易日的日线 prev_settlement 即该日昨结算）
+                if(!isVoid(preMap) && barT.rows() > 0) {
+                    bk = string(barT.symbol) + "|" + temporalFormat(barT.trade_date, "yyyyMMdd")
+                    ps = preMap[bk]
+                    barT = select trade_date, datetime, interval, series, exchange, variety, symbol,
+                            open, high, low, close, ps as pre_settle, settle, volume, turnover,
+                            open_interest, next_symbol, src, update_time from barT
+                }
+                if(barT.rows() > 0) {
+                    barTbl.append!(barT)
+                    totalBar += barT.rows()
+                }
+            }
+        }
+
+        // contract 由“交易日 × 上市合约”生成，与当日是否有行情无关
+        if(frequency == "1d" && !isNull(conTbl)) {
+            grid = rqContractGrid(instX, string(batch), tradeDates)
+            conT = rqBuildContract(grid, rqLimitTable(raw), prev, dom)
+            if(conT.rows() > 0) {
+                conTbl.append!(conT)
+                totalCon += conT.rows()
+            }
+        }
+
+        print("[RQ] 批次 " + string(i + 1) + "/" + string(nBatch) + " 合约=" + string(batch.size()) +
+              " bar=" + string(barT.rows()) + " 累计=" + string(totalBar))
+        sleep(200)
+    }
+
+    rqLog("rqdata_sync", "bar", "ALL", frequency, startDate, endDate, totalBar, "SUCCESS",
+          "contract=" + string(totalCon))
+    print("[RQ] 同步完成 frequency=" + frequency + " bar=" + string(totalBar) + " contract=" + string(totalCon))
+    return totalBar
+}
+
+// ============================================================================
+// 10. 交易日历同步（exchange 统一记 ALL，与库内现有口径一致）
+// ============================================================================
+def rqSyncCalendar(user, pwd, startDate, endDate) {
+    raw = RQData::rqTradingDates(user, pwd, startDate, endDate)
+    if(raw.rows() == 0) return 0
+    cols = raw.columnNames()
+    if(cols.size() == 0) return 0
+
+    dates = rqToDate(raw[cols[0]])
+    dates = dates[!isNull(dates)]
+    if(dates.size() == 0) return 0
+
+    cal = rqLoad("calendar")
+    exist = exec trade_date from cal
+    newDates = dates[not (dates in exist)]
+    if(newDates.size() == 0) return 0
+
+    k = newDates.size()
+    cal.append!(table(newDates as trade_date, symbol(take("ALL", k)) as exchange,
+        take(nanotimestamp(now()), k) as update_time))
+    print("[RQ] calendar 新增交易日 " + string(k) + " 个")
+    return k
+}
+
+// ============================================================================
+// 11. 无参入口：每日定时任务
+//     17:00 盘后跑，回看 10 天补漏（幂等，重复覆盖）
+// ============================================================================
+def rqDailyJob() {
+    user = rqGetCred("user")
+    pwd = rqGetCred("pwd")
+    if(user == "" || pwd == "") {
+        print("[RQ] 未配置 RQData 账号密码（先执行 syncRqData::rqSetCred(user, pwd)），定时任务跳过")
+        return -1
+    }
+
+    endDate = today()
+    bar = rqLoad("bar")
+    lastD = exec max(trade_date) from bar where interval == "1d"
+    startDate = iif(isNull(lastD), date(2010.01.01), lastD - 10)
+
+    nBar = rqSyncBars(user, pwd, startDate, endDate, "1d", 50)
+    nCal = rqSyncCalendar(user, pwd, startDate, endDate)
+
+    res = dict(STRING, ANY)
+    res["bars"] = nBar
+    res["calendar"] = nCal
+    return res
+}
+
+// ============================================================================
+// 12. 全历史回补入口（手动执行一次）
+// ============================================================================
+def rqBackfillAll(user, pwd, startDate) {
+    nCal = rqSyncCalendar(user, pwd, startDate, today())
+    nBar = rqSyncBars(user, pwd, startDate, today(), "1d", 50)
+    res = dict(STRING, ANY)
+    res["calendar"] = nCal
+    res["bars"] = nBar
+    return res
+}
+
+// ============================================================================
+// 14. 分钟线昨结算回填（历史数据，幂等）
+//     场景：bar 表里已有的分钟线 pre_settle 为空（例如用旧版本写入的数据）
+//     做法：按月 × 合约批 读出 -> 用同日日线的 prev_settlement 重算 -> 追加写回
+//           依赖 TSDB keepDuplicates=LAST，同 (symbol, interval, datetime) 后写覆盖
+// ============================================================================
+def rqFillPreSettle(user, pwd, startDate, endDate, frequency="1m", batchSize=50) {
+    barTbl = rqLoad("bar")
+    syms = exec distinct symbol from barTbl where trade_date between startDate : endDate and interval == frequency
+    if(syms.size() == 0) {
+        print("[RQ] " + frequency + " 区间内无数据，无需回填")
+        return 0
+    }
+
+    total = 0
+    cur = date(year(startDate), month(startDate), 1)
+    lastM = date(year(endDate), month(endDate), 1)
+    while(cur <= lastM) {
+        s0 = iif(cur > startDate, cur, startDate)
+        mEnd = date(cur + 1M) - 1
+        s1 = iif(mEnd < endDate, mEnd, endDate)
+
+        nBatch = int(ceil(syms.size() / double(batchSize)))
+        for(i in 0:nBatch) {
+            lo = i * batchSize
+            hi = min((i + 1) * batchSize, syms.size())
+            batch = syms[lo:hi]
+            seg = select * from barTbl where symbol in batch and trade_date between s0 : s1 and interval == frequency
+            if(seg.rows() == 0) continue
+            pt = rqDailyPreSettle(user, pwd, string(batch), s0, s1)
+            ps = take(double(NULL), seg.rows())
+            if(pt.rows() > 0) {
+                pm = dict(pt.k, pt.v)
+                bk = string(seg.symbol) + "|" + temporalFormat(seg.trade_date, "yyyyMMdd")
+                ps = pm[bk]
+            }
+            seg = select trade_date, datetime, interval, series, exchange, variety, symbol,
+                  open, high, low, close, ps as pre_settle, settle, volume, turnover,
+                  open_interest, next_symbol, src, update_time from seg
+            barTbl.append!(seg)
+            total += seg.rows()
+        }
+        print("[RQ] pre_settle 回填 " + temporalFormat(cur, "yyyy-MM") + " 完成，累计 " + string(total) + " 行")
+        cur = cur + 1M
+    }
+
+    rqLog("rqdata_fill_pre_settle", "bar", "ALL", frequency, startDate, endDate, total, "SUCCESS", "")
+    print("[RQ] pre_settle 回填结束，共 " + string(total) + " 行")
+    return total
+}
+
+// ============================================================================
+// 15. 分钟线每日增量入口（无参，供 scheduleJob 调用）
+//     固定回看 lookback 天，幂等覆盖；pre_settle 在写入时自动补齐
+// ============================================================================
+def rqMinuteJob(lookback=5, frequency="1m", batchSize=5) {
+    user = rqGetCred("user")
+    pwd = rqGetCred("pwd")
+    if(user == "" || pwd == "") {
+        print("[RQ] 未配置 RQData 凭证（先执行 syncRqData::rqSetCred(user, pwd)），分钟线任务跳过")
+        return -1
+    }
+    endDate = today()
+    startDate = endDate - lookback
+    print("[RQ] 分钟线增量：" + string(startDate) + " ~ " + string(endDate) + " frequency=" + frequency)
+    return rqSyncBars(user, pwd, startDate, endDate, frequency, batchSize)
+}
+
+// ============================================================================
+// 16. 定时任务注册（手动执行一次：syncRqData::rqRegisterJob()）
+//     注意：jobFunc 必须是无参函数，账号密码通过 rqSetCred 存在共享表里
+// ============================================================================
+def rqRegisterJob() {
+    scheduleJob(jobId=`sync_futu_rqdata_daily,
+                jobDesc="sync_futu_rqdata_daily_incremental",
+                jobFunc=rqDailyJob,
+                scheduleTime=[17:00m],
+                startDate=today(),
+                endDate=2050.12.31,
+                frequency='D')
+    print("[RQ] 已注册定时任务 sync_futu_rqdata_daily（每日 17:00）")
+    return true
+}
