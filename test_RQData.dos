@@ -797,10 +797,10 @@ assert 1, cfFut.rows() == 0
 @testing:case = "test_rqInitDb"
 print("\n=== 测试 rqInitDb (建库建表) ===")
 syncRqData::rqInitDb()
-assert 1, existsTable("dfs://FUTU_bar", "data")
-assert 2, existsTable("dfs://FUTU_contract", "data")
-assert 3, existsTable("dfs://FUTU_calendar", "data")
-assert 4, existsTable("dfs://FUTU_synclog", "data")
+assert 1, existsTable("dfs://RQDATA.futu_bar", "data")
+assert 2, existsTable("dfs://RQDATA.futu_contract", "data")
+assert 3, existsTable("dfs://RQDATA.futu_calendar", "data")
+assert 4, existsTable("dfs://RQDATA.futu_synclog", "data")
 print("建库建表验证通过")
 
 @testing:case = "test_rqFetchInstruments"
@@ -818,8 +818,8 @@ print("合约清单验证通过，合约数=" + string(instCnt.n[0]))
 @testing:case = "test_rqSyncBars_one_day"
 print("\n=== 测试 rqSyncBars (单日日线落库) ===")
 syncRqData::rqSyncBars(user, pwd, 2024.10.08, 2024.10.08, "1d", 50)
-barT = loadTable("dfs://FUTU_bar", "data")
-conT = loadTable("dfs://FUTU_contract", "data")
+barT = loadTable("dfs://RQDATA.futu_bar", "data")
+conT = loadTable("dfs://RQDATA.futu_contract", "data")
 barCnt = select count(*) as n from barT where trade_date == 2024.10.08 and interval == "1d"
 assert 1, barCnt.n[0] > 0
 conCnt = select count(*) as n from conT where trade_date == 2024.10.08

@@ -11,7 +11,7 @@
 - **CSV 自动解析**：RQData 返回 CSV 文本，模块自动落临时文件、按 STRING 读入、解析后立即删除临时文件。
 - **统一类型口径**：所有列先按 STRING 读入，再由业务层显式转型，避免空串导致 `loadText` 类型推断失败。
 - **四类资产覆盖**：行情按资产类型自动匹配字段；另提供期货主力/仓单/持仓排名、股票分红/复权/因子/行业/两融/港股通/资金流等专项接口。
-- **期货落库开箱即用**：配套 `syncRqData` 模块，`rqInitDb()` 一键建库建表，可把全市场期货日线/分钟线/合约快照写入 `dfs://FUTU_*`。
+- **期货落库开箱即用**：配套 `syncRqData` 模块，`rqInitDb()` 一键建库建表，可把全市场期货日线/分钟线/合约快照写入 `dfs://RQDATA.futu_*`。
 
 ---
 
@@ -282,10 +282,10 @@ Table，单列日期。
 
 | 库表 | 内容 | 引擎 / 分区 |
 | :-- | :-- | :-- |
-| `dfs://FUTU_bar.data` | 日线 + 分钟线，19 列 | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,interval,datetime` |
-| `dfs://FUTU_contract.data` | 每日合约快照，18 列（含 `industry`、`dominant_id`） | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,trade_date` |
-| `dfs://FUTU_calendar.data` | 交易日历 | VALUE（`trade_date` 月） |
-| `dfs://FUTU_synclog.data` | 同步日志 | VALUE（`start_date` 月） |
+| `dfs://RQDATA.futu_bar.data` | 日线 + 分钟线，19 列 | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,interval,datetime` |
+| `dfs://RQDATA.futu_contract.data` | 每日合约快照，18 列（含 `industry`、`dominant_id`） | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,trade_date` |
+| `dfs://RQDATA.futu_calendar.data` | 交易日历 | VALUE（`trade_date` 月） |
+| `dfs://RQDATA.futu_synclog.data` | 同步日志 | VALUE（`start_date` 月） |
 
 合约静态信息不单独建维表：`contract` 每个交易日都有一行完整快照，取 `max(trade_date)` 那天即“当前合约池”，合约清单每次同步由 `all_instruments` 现取。
 
@@ -355,7 +355,7 @@ use syncRqData
 syncRqData::rqInitDb()
 ```
 
-之后的同步函数默认这些库表已存在（`rqLoad` 内部用 `loadTable("dfs://FUTU_xxx", "data")`）。
+之后的同步函数默认这些库表已存在（`rqLoad` 内部用 `loadTable("dfs://RQDATA.futu_xxx", "data")`）。
 
 ### 4.3 首次构建流程
 
@@ -412,7 +412,7 @@ scheduleJob(jobId=`sync_futu_rqdata_minute,
 `contract` 每个交易日一行完整快照（静态字段 + 当日涨跌停），所以不再需要单独的 `contract_meta`：
 
 ```dolphindb
-con = loadTable("dfs://FUTU_contract", "data")
+con = loadTable("dfs://RQDATA.futu_contract", "data")
 // 当前合约池（= 最近一个交易日仍在上市的合约）
 lastD = exec max(trade_date) from con
 cur = select * from con where trade_date == lastD
@@ -441,7 +441,7 @@ RQData 的 `all_instruments(type="Future")` 已经包含连续合约，`rqSyncBa
 `contract.dominant_id` 记录 `88/888` 当日对应的真实主力合约（`99` 与普通合约为空）：
 
 ```dolphindb
-con = loadTable("dfs://FUTU_contract", "data")
+con = loadTable("dfs://RQDATA.futu_contract", "data")
 // AU888 在某天对应哪个真实合约
 select trade_date, dominant_id from con where symbol == "AU888" and trade_date == 2024.10.08
 // AU888 数据 = AU 品种的主力前复权序列，回测换月时用 dominant_id 对接真实合约
@@ -581,6 +581,10 @@ tb = RQData::rqGetPrice("license", "<License Key>", ["AU2412"], 2024.10.08, 2024
 ---
 
 ## 8. 版本更新说明 (Changelog)
+
+### v1.5.2（syncRqData）
+
+- 库名恢复为 `dfs://RQDATA.futu_bar` / `futu_contract` / `futu_calendar` / `futu_synclog`，表名仍为 `data`。
 
 ### v1.5.1（syncRqData）
 

@@ -6,10 +6,10 @@ module syncRqData
  * 加载：先 use RQData，再 use syncRqData
  *
  * 目标库（每张表一个独立 database，表名统一为 data；首次使用先执行 rqInitDb() 建库建表）：
- *   dfs://FUTU_bar.data           日线/分钟线（19 列，TSDB，按 trade_date 月分区）
- *   dfs://FUTU_contract.data      每日合约快照（17 列，TSDB，上市期间每个交易日一行，含无成交合约）
- *   dfs://FUTU_calendar.data      交易日历
- *   dfs://FUTU_synclog.data       同步日志
+ *   dfs://RQDATA.futu_bar.data           日线/分钟线（19 列，TSDB，按 trade_date 月分区）
+ *   dfs://RQDATA.futu_contract.data      每日合约快照（18 列，TSDB，上市期间每个交易日一行，含无成交与连续合约）
+ *   dfs://RQDATA.futu_calendar.data      交易日历
+ *   dfs://RQDATA.futu_synclog.data       同步日志
  *
  * 合约静态信息不单独建维表：contract 每个交易日都有一行完整快照，
  * 取 max(trade_date) 那天即“当前合约池”；合约清单每次同步由 all_instruments 现取。
@@ -48,7 +48,7 @@ module syncRqData
  *   rqBackfillAll(user, pwd, startDate)              全历史回补（日线）
  *   rqRegisterJob()                                  注册每日 17:00 定时任务
  *
- * 版本: 1.5.1
+ * 版本: 1.5.2
  */
 
 // ============================================================================
@@ -61,7 +61,7 @@ def module_info() {
      */
     res = dict(STRING, ANY)
     res["moduleName"] = "syncRqData"
-    res["moduleVersion"] = "1.5.1"
+    res["moduleVersion"] = "1.5.2"
     res["isFree"] = true
     res["description"] = "DolphinDB syncRqData Module (Futures ETL via RQData)"
     return res
@@ -71,7 +71,7 @@ def module_info() {
 // 1. 表结构与载入
 // ============================================================================
 def rqLoad(name) {
-    return loadTable("dfs://FUTU_" + name, "data")
+    return loadTable("dfs://RQDATA.futu_" + name, "data")
 }
 
 def rqEmptyBar() {
@@ -104,27 +104,27 @@ def rqEmptySyncLog() {
 //     bar/contract 按 trade_date 月分区；分钟线与日线共用 bar 表，用 interval 区分
 // ============================================================================
 def rqInitDb() {
-    if(!existsDatabase("dfs://FUTU_bar")) {
-        dbBar = database("dfs://FUTU_bar", VALUE, 2010.01M..2030.12M, engine="TSDB")
+    if(!existsDatabase("dfs://RQDATA.futu_bar")) {
+        dbBar = database("dfs://RQDATA.futu_bar", VALUE, 2010.01M..2030.12M, engine="TSDB")
         // keepDuplicates=LAST：同 (symbol, interval, datetime) 后写覆盖，增量任务重跑幂等
         // 必须带 interval：日线落在 15:00，与最后一根 1 分钟线时间戳相同，不带 interval 会互相覆盖
         dbBar.createPartitionedTable(table=rqEmptyBar(), tableName="data",
             partitionColumns=`trade_date, sortColumns=`symbol`interval`datetime, keepDuplicates=LAST)
     }
-    if(!existsDatabase("dfs://FUTU_contract")) {
-        dbCon = database("dfs://FUTU_contract", VALUE, 2010.01M..2030.12M, engine="TSDB")
+    if(!existsDatabase("dfs://RQDATA.futu_contract")) {
+        dbCon = database("dfs://RQDATA.futu_contract", VALUE, 2010.01M..2030.12M, engine="TSDB")
         dbCon.createPartitionedTable(table=rqEmptyContract(), tableName="data",
             partitionColumns=`trade_date, sortColumns=`symbol`trade_date, keepDuplicates=LAST)
     }
-    if(!existsDatabase("dfs://FUTU_calendar")) {
-        dbCal = database("dfs://FUTU_calendar", VALUE, 2010.01M..2030.12M)
+    if(!existsDatabase("dfs://RQDATA.futu_calendar")) {
+        dbCal = database("dfs://RQDATA.futu_calendar", VALUE, 2010.01M..2030.12M)
         dbCal.createPartitionedTable(table=rqEmptyCalendar(), tableName="data", partitionColumns=`trade_date)
     }
-    if(!existsDatabase("dfs://FUTU_synclog")) {
-        dbLog = database("dfs://FUTU_synclog", VALUE, 2010.01M..2030.12M)
+    if(!existsDatabase("dfs://RQDATA.futu_synclog")) {
+        dbLog = database("dfs://RQDATA.futu_synclog", VALUE, 2010.01M..2030.12M)
         dbLog.createPartitionedTable(table=rqEmptySyncLog(), tableName="data", partitionColumns=`start_date)
     }
-    print("[RQ] 建库建表完成（FUTU_bar / FUTU_contract / FUTU_calendar / FUTU_synclog）")
+    print("[RQ] 建库建表完成（RQDATA.futu_bar / futu_contract / futu_calendar / futu_synclog）")
     return true
 }
 
@@ -247,7 +247,7 @@ def rqPrevSnapshot(startDate) {
     empty = table(1:0,
         `symbol`margin_ratio`max_order_vol`commission_unit`pricetick`commission_num,
         [SYMBOL, DOUBLE, DOUBLE, STRING, DOUBLE, DOUBLE])
-    if(!existsTable("dfs://FUTU_contract", "data")) return empty
+    if(!existsTable("dfs://RQDATA.futu_contract", "data")) return empty
     con = rqLoad("contract")
     lastD = exec max(trade_date) from con where trade_date < startDate
     if(isNull(lastD)) return empty
@@ -288,8 +288,8 @@ def rqEnrichInstruments(inst, prev) {
 }
 
 // ============================================================================
-// 7. RQData 原始 CSV 表 -> FUTU.bar 行
-//    列必须严格按 FUTU.bar 顺序输出
+// 7. RQData 原始 CSV 表 -> futu_bar 行
+//    列必须严格按 futu_bar 顺序输出
 // ============================================================================
 def rqBuildBar(raw, inst, interval, src) {
     n = raw.rows()
@@ -364,7 +364,7 @@ def rqBuildBar(raw, inst, interval, src) {
 // 区间内的交易日：优先用库内日历，缺失时直接问 RQData，最后退化为自然日
 def rqRangeDates(user, pwd, startDate, endDate) {
     d = array(DATE, 0)
-    if(existsTable("dfs://FUTU_calendar", "data")) {
+    if(existsTable("dfs://RQDATA.futu_calendar", "data")) {
         try {
             cal = rqLoad("calendar")
             d = exec trade_date from cal where trade_date >= startDate, trade_date <= endDate
