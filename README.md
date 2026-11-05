@@ -582,6 +582,11 @@ tb = RQData::rqGetPrice("license", "<License Key>", ["AU2412"], 2024.10.08, 2024
 
 ## 8. 版本更新说明 (Changelog)
 
+### v1.5.1（syncRqData）
+
+- 修复 `rqInitDb` 的 `keepDuplicates` 参数：TSDB 要求枚举 `LAST`，传字符串 `"LAST"` 会报错。
+- 修复 `rqFillPreSettle` 的月份起始计算：`date(year, month, 1)` 不是合法写法，改用 `d - dayOfMonth(d) + 1`。
+
 ### v1.5.0（syncRqData）
 
 - 连续合约（`XX88` 主力连续、`XX888` 价差平滑、`XX99` 指数连续）随正常合约一并同步，`contract` 每个交易日为其生成一行。

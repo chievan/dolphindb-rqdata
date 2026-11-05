@@ -48,7 +48,7 @@ module syncRqData
  *   rqBackfillAll(user, pwd, startDate)              全历史回补（日线）
  *   rqRegisterJob()                                  注册每日 17:00 定时任务
  *
- * 版本: 1.5.0
+ * 版本: 1.5.1
  */
 
 // ============================================================================
@@ -61,7 +61,7 @@ def module_info() {
      */
     res = dict(STRING, ANY)
     res["moduleName"] = "syncRqData"
-    res["moduleVersion"] = "1.5.0"
+    res["moduleVersion"] = "1.5.1"
     res["isFree"] = true
     res["description"] = "DolphinDB syncRqData Module (Futures ETL via RQData)"
     return res
@@ -109,12 +109,12 @@ def rqInitDb() {
         // keepDuplicates=LAST：同 (symbol, interval, datetime) 后写覆盖，增量任务重跑幂等
         // 必须带 interval：日线落在 15:00，与最后一根 1 分钟线时间戳相同，不带 interval 会互相覆盖
         dbBar.createPartitionedTable(table=rqEmptyBar(), tableName="data",
-            partitionColumns=`trade_date, sortColumns=`symbol`interval`datetime, keepDuplicates="LAST")
+            partitionColumns=`trade_date, sortColumns=`symbol`interval`datetime, keepDuplicates=LAST)
     }
     if(!existsDatabase("dfs://FUTU_contract")) {
         dbCon = database("dfs://FUTU_contract", VALUE, 2010.01M..2030.12M, engine="TSDB")
         dbCon.createPartitionedTable(table=rqEmptyContract(), tableName="data",
-            partitionColumns=`trade_date, sortColumns=`symbol`trade_date, keepDuplicates="LAST")
+            partitionColumns=`trade_date, sortColumns=`symbol`trade_date, keepDuplicates=LAST)
     }
     if(!existsDatabase("dfs://FUTU_calendar")) {
         dbCal = database("dfs://FUTU_calendar", VALUE, 2010.01M..2030.12M)
@@ -759,8 +759,8 @@ def rqFillPreSettle(user, pwd, startDate, endDate, frequency="1m", batchSize=50)
     }
 
     total = 0
-    cur = date(year(startDate), month(startDate), 1)
-    lastM = date(year(endDate), month(endDate), 1)
+    cur = startDate - dayOfMonth(startDate) + 1
+    lastM = endDate - dayOfMonth(endDate) + 1
     while(cur <= lastM) {
         s0 = iif(cur > startDate, cur, startDate)
         mEnd = date(cur + 1M) - 1
