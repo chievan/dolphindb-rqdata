@@ -866,4 +866,59 @@ assert 1, "RQData" in getLoadedModules().moduleName
 assert 2, "syncRqData" in getLoadedModules().moduleName
 print("模块依赖验证通过")
 
+// ====================================================
+// 第六部分：定时任务（默认不启用，仅保留代码）
+// ====================================================
+// 本节只定义函数、不执行任何注册动作，跑完整个脚本不会产生定时任务。
+// 确认要上线时，手工执行一次：
+//     enableRqScheduleJob("license", "<License Key>")
+// 撤销：
+//     disableRqScheduleJob()
+// 查看：
+//     getScheduledJobs()
+//
+// 执行时点待观察（下面的 17:00 / 17:30 只是暂定值）：
+//   当天行情（open/high/low/close/volume）通常收盘后很快就更新，
+//   但结算价 settlement 要等交易所盘后结算，实测在 15:00 之后、21:00 之前
+//   的某个时点才最终确定。若任务跑得太早，settle 可能为空或是临时值。
+//   需要连续几天在不同时点（如 16:00 / 17:00 / 18:00 / 20:00 / 21:00）
+//   抽查 bar.settle 是否已非空且稳定，再据此定下最终 scheduleTime。
+//   兜底：rqDailyJob 每次回看 10 天，配合 TSDB keepDuplicates=LAST，
+//   次日重跑会把前一天的 settle 覆盖成最终值，延迟一天自动修正。
+
+def enableRqScheduleJob(user, pwd) {
+    // 1. 凭证写入共享表 rq_config：任务函数必须无参，只能从共享表里取凭证
+    syncRqData::rqSetCred(user, pwd)
+
+    // 2. 日线 + contract 快照：每日 17:00，回看 10 天补漏（幂等）
+    scheduleJob(jobId=`sync_futu_rqdata_daily,
+                jobDesc="sync_futu_rqdata_daily_incremental",
+                jobFunc=syncRqData::rqDailyJob,
+                scheduleTime=[17:00m],
+                startDate=today(),
+                endDate=2050.12.31,
+                frequency='D')
+
+    // 3. 分钟线增量：每日 17:30（等日线写完再跑）
+    //    只拉库里缺的交易日，已完整的跳过，不重复消耗配额
+    scheduleJob(jobId=`sync_futu_rqdata_minute,
+                jobDesc="sync_futu_rqdata_minute_incremental",
+                jobFunc=syncRqData::rqMinuteJob,
+                scheduleTime=[17:30m],
+                startDate=today(),
+                endDate=2050.12.31,
+                frequency='D')
+
+    print("[RQ] 定时任务已注册：17:00 日线 / 17:30 分钟线")
+    return getScheduledJobs()
+}
+
+def disableRqScheduleJob() {
+    // 任务不存在时 deleteScheduledJob 会抛异常，逐个吞掉
+    try { deleteScheduledJob("sync_futu_rqdata_daily") } catch(ex) { }
+    try { deleteScheduledJob("sync_futu_rqdata_minute") } catch(ex) { }
+    print("[RQ] 定时任务已移除")
+    return getScheduledJobs()
+}
+
 print("\n--- 全部测试执行完成 ---")

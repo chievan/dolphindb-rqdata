@@ -282,8 +282,8 @@ Table，单列日期。
 
 | 库表 | 内容 | 引擎 / 分区 |
 | :-- | :-- | :-- |
-| `dfs://RQDATA.futu_bar.data` | 日线 + 分钟线，19 列 | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,interval,datetime` |
-| `dfs://RQDATA.futu_contract.data` | 每日合约快照，18 列（含 `industry`、`dominant_id`） | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,trade_date` |
+| `dfs://RQDATA.futu_bar.data` | 日线 + 分钟线，17 列 | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,interval,datetime` |
+| `dfs://RQDATA.futu_contract.data` | 每日合约快照，21 列（含 `industry`、`variety_cn`、`delivery_month`、`dominant_id`） | TSDB，VALUE（`trade_date` 月），`sortColumns=symbol,trade_date` |
 | `dfs://RQDATA.futu_calendar.data` | 交易日历 | VALUE（`trade_date` 月） |
 | `dfs://RQDATA.futu_synclog.data` | 同步日志 | VALUE（`start_date` 月） |
 
@@ -318,7 +318,7 @@ contract_multiplier, trading_code, market_tplus, start_delivery_date,
 end_delivery_date, trading_hours, industry_name
 ```
 
-> 期货没有中文合约名：`symbol`/`trading_code` 是小写代码（`au2412`），老合约是中文（`豆一0303`）。落库的 `contract.name` 因此为空串，需要中文名只能由业务侧维护字典。
+> 期货中文合约名按交易所不统一：大商所/中金所/广期所的 `symbol` 是中文简称（`豆一2701`、`股指2612`、`碳酸锂2701`），上期所/郑商所/能源中心只返回小写代码（`rb2701`、`CF2701`、`sc2612`）。落库时由 `rqVarietyCnNames` 内置字典把这些交易所还原为「品种中文名 + 交割月」（`rb2701` → `螺纹钢2701`），连续合约后缀与 RQData 自带命名保持一致（`主力连续` / `主力连续价差平滑` / `主力连续价差平滑（后复权）` / `次主力连续` / `指数连续`）。
 
 探测方式：任何接口返回的都是 CSV，用 `schema()` 直接看列名与类型。
 
@@ -340,10 +340,17 @@ RQData::rqAllInstruments("license", key, "Future").schema()
 | `limit_up` / `limit_down` | 同名 | 写入 contract 快照 |
 | `contract_multiplier` | `size` | 合约乘数 |
 | `listed_date` / `de_listed_date` | `list_date` / `last_date` | 上市/退市日 |
-| `margin_rate` | `margin_ratio` | 保证金率，写入 `contract` 快照 |
+| `margin_rate` | `margin_ratio` | 保证金率，写入 `contract` 快照（原始值为 Python 浮点，落库前保留 6 位小数） |
 | `industry_name` | `industry` | 行业分类，写入 `contract` 快照 |
+| `get_tick_size` 的 `tick_size` | `pricetick` | 最小变动价位，`all_instruments` 不含，按候选合约单独请求 |
+| `get_trading_parameters` 的 `open_commission` | `commission_num` | 开仓手续费 |
+| 同上 `commission_type` | `commission_unit` | `by_volume` → `元/手`（原值）；`by_money` → `%`（比例 ×100） |
+| 同上 `max_order_quantity` | `max_order_vol` | 单笔最大下单量（手）。交易所只报 `max_order_quantity` 与 `client_limit` 其中之一，故该列会大面积为空，属数据源口径 |
+| 同上 `client_limit` | `client_limit` | 客户限仓（手）。与 `max_order_vol` 互补：`RB2701` 只报最大下单量 32000，`A2701` 只报限仓 17779 |
 
-RQData 不提供 `commission_num`、`commission_unit`、`max_order_vol`、`pricetick`，落库时按“同合约 → 同品种”继承 `startDate` 之前最近一份 `contract` 快照的原值。
+contract 字段的取值优先级：**RQData 当日值 → 当日主力合约（88/888/889 借用）→ 当日次主力合约（88A2 借用）→ 同品种当日主力合约（99 兜底）→ `startDate` 之前最近一份 contract 快照**。
+已退市品种（ER / LR / ME / RO / TC / WS / WT）的连续合约在 RQData 侧没有任何交易参数，`commission_num` / `max_order_vol` / `client_limit` 保持 NULL。
+2026-11-04 实测覆盖率：`max_order_vol` 496/870、`client_limit` 867/870（仅 `AD2701`、`HC2701`、`RB2701` 为空，前两者分别只报限仓或只报下单量）。
 
 ### 4.2 建库建表
 
@@ -365,24 +372,23 @@ syncRqData::rqInitDb()
 user = "license"
 key  = "<License Key>"
 
-syncRqData::rqInitDb()                                // 1. 建库建表
-syncRqData::rqSetCred(user, key)                      // 2. 凭证写共享表（定时任务用）
-syncRqData::rqSyncCalendar(user, key, 2010.01.01, today())   // 3. 交易日历
-syncRqData::rqSyncBars(user, key, 2010.01.01, today(), "1d", 50)  // 4. 日线全历史（同时写 contract 快照）
+syncRqData::rqInitDb()                                        // 1. 建库建表
+syncRqData::rqSetCred(user, key)                              // 2. 凭证写共享表（定时任务用）
+syncRqData::rqBackfillAll(user, key, 2010.01.01)              // 3. 日线 + contract 快照 + 交易日历
+syncRqData::rqBackfillMinute(user, key, 2026.09.01, today())  // 4. 分钟线（按需，很吃配额）
 ```
+
+> 两个回补入口都是**基于库内已有数据判断**：已经完整的交易日直接跳过，不会重复拉取，可放心反复执行。底层无条件重拉的 `rqSyncBars` 仅用于调试或强制重刷。
 
 > `rqSyncBars(..., "1d")` 会同时写 `contract` 快照：按“交易日 × 上市合约”生成，**上市期间每个交易日一行**，与该合约当日是否有成交无关。停牌/无成交的行仍保留，只是 `limit_up`/`limit_down` 为 NULL。
 
-分钟线单独回补，建议**按区间分段、缩小 batchSize**（单次请求的合约越少、区间越短，越不容易超时）：
+分钟线**很吃配额**（全市场单日约 44 万行、约 37 MB），回补前先算好余量：
 
 ```dolphindb
-// 每次回补约一个月、每批 5 个合约，循环推进
-for(d in 2024.01M..2024.12M) {
-    syncRqData::rqSyncBars(user, key, date(d), date(d + 1M) - 1, "1m", 5)
-}
+syncRqData::rqGetQuota(user, key)   // 查看已用/上限/剩余天数
 ```
 
-容量参考：单个合约 1 分钟线约 555 行/交易日；全市场活跃合约约 1200 个，一天约 60 万行，一年约 1.5 亿行。`bar` 表按月分区，TSDB 下该量级可直接 append。
+容量参考：单个合约 1 分钟线约 555 行/交易日；全市场活跃合约约 1300 个，一天约 44 万行，一年约 1.1 亿行。`bar` 表按月分区，TSDB 下该量级可直接 append。
 
 ### 4.4 分钟线 pre_settle 补齐
 
@@ -434,16 +440,33 @@ RQData 的 `all_instruments(type="Future")` 已经包含连续合约，`rqSyncBa
 | :-- | :-- | :-- |
 | `XX88` | 主力连续 | 不复权（换月跳空） |
 | `XX888` | 主力连续价差平滑 | 前复权（实测与 `adjust_type="pre"` 完全一致） |
+| `XX889` | 主力连续价差平滑（后复权） | 后复权 |
+| `XX88A2` | 次主力连续 | 不复权 |
+| `XX88A3` | 次次主力连续（仅股指期货） | 不复权 |
 | `XX99` | 指数连续（全合约加权） | 无复权概念 |
 
-三者的 `listed_date` / `de_listed_date` 都是 `0000-00-00`，模块按 NULL 处理，因此上市期间每个交易日都会生成 `contract` 行。
+它们的 `listed_date` / `de_listed_date` 都是 `0000-00-00`，模块按 NULL 处理，因此上市期间每个交易日都会生成 `contract` 行。
 
-`contract.dominant_id` 记录 `88/888` 当日对应的真实主力合约（`99` 与普通合约为空）：
+`contract.dominant_id` 记录连续合约当日对应的真实合约（普通合约与 `99` 为空）：
+
+| 连续合约 | dominant_id 来源 |
+| :-- | :-- |
+| `XX88` / `XX888` / `XX889` | `futures.get_dominant_price` 的 `dominant_id`（当日主力） |
+| `XX88A2` | `futures.get_dominant(rank=2)`（当日次主力）；股指期货默认 rule 无结果，自动改用 `rule=1` |
+| `XX88A3` | `futures.get_dominant(rank=3)`（当日次次主力），同上 |
+| `XX99` | 留空（指数连续无单一映射合约） |
+
+`contract` 还提供两个便于筛选的维度列：
+
+| 列 | 说明 |
+| :-- | :-- |
+| `variety_cn` | 品种中文名（`RB2701` → `螺纹钢`、`CF99` → `棉花`、`IF88A3` → `沪深300股指`） |
+| `delivery_month` | 交割月份 MONTH（`RB2701` → `2027.01M`）；连续合约为 NULL，可用 `isNull(delivery_month)` 区分真实合约与连续合约 |
 
 ```dolphindb
 con = loadTable("dfs://RQDATA.futu_contract", "data")
-// AU888 在某天对应哪个真实合约
-select trade_date, dominant_id from con where symbol == "AU888" and trade_date == 2024.10.08
+// AU888 / AU88A2 在某天各自对应哪个真实合约
+select trade_date, symbol, dominant_id from con where symbol in ["AU888","AU88A2"] and trade_date == 2024.10.08
 // AU888 数据 = AU 品种的主力前复权序列，回测换月时用 dominant_id 对接真实合约
 ```
 
@@ -581,6 +604,68 @@ tb = RQData::rqGetPrice("license", "<License Key>", ["AU2412"], 2024.10.08, 2024
 ---
 
 ## 8. 版本更新说明 (Changelog)
+
+### v1.8.0（syncRqData）
+
+- 新增 `rqPlanBackfill(user, pwd, startDate, endDate, includeMinute)`：**不拉行情**的预算预估，输出每段交易日数、缺失天数与估算 GB，并对比当前剩余额度算出缺口。谈额度前先用它量数。
+- 新增 `rqQuotaLeftMb`（剩余配额）、`rqSegByYear` / `rqSegByDays`（分段器）、`rqRunBackfill`（带配额保护的逐段执行）。
+- `rqBackfillAll` 改为按自然年分段、`rqBackfillMinute` 改为按 10 天分段（默认合约批 20），避免全历史区间一次性请求超时或内存暴涨；每段前检查剩余配额，低于 2 GB 自动停止。
+- 两个回补入口均支持断点续跑：中断后重跑只补缺口。
+- 修正：`for(y in a:b+1)` 会被解析成 `(a:b)+1` 导致循环为空，必须写 `a:(b+1)`；`e` 是 DolphinDB 自然常数，不能作变量名；形参为常量，不能原地赋默认值。
+
+### v1.7.0（syncRqData）
+
+- 新增 `rqSyncIncremental(user, pwd, frequency, startDate, endDate, batchSize, refreshDays)`：按库内已有数据判断要拉哪些交易日，已完整的直接跳过，不再盲目重拉。判定标准为“当日 bar 覆盖率 ≥ 当日 contract 行数的 90%”，覆盖率不足视为批次失败、重拉。
+- 新增 `rqFilledDates`（判定已完整交易日）与 `rqDateSegments`（把连续交易日合并成区间，减少 `all_instruments` 重复拉取）。
+- `rqBackfillAll` / `rqBackfillMinute` 改为走增量判定，可反复执行；新增 `rqBackfillMinute` 分钟线回补入口。
+- `rqDailyJob` 回看窗口 10 → 30 天，另强制刷新最近 3 个交易日，用于纠正收盘后才最终确定的结算价。
+- `rqMinuteJob` 默认 `batchSize` 5 → 50，`lookback` 5 → 10，且改为只拉缺的交易日。
+- 修正：此前分钟线每日固定回看 5 天，等于每天重复拉 5 × 37 MB ≈ 185 MB，配额消耗严重。
+
+### v1.6.0（syncRqData）
+
+- `contract` 新增 `client_limit`（DOUBLE，客户限仓），共 21 列，取 `futures.get_trading_parameters` 的 `client_limit`。
+- 原因：交易所只报 `max_order_quantity` 与 `client_limit` 其中之一，此前用 `max_order_quantity` 时 374/870 真实合约为空；两列并列后真实合约覆盖 496 + 867 行，互不混用口径。两列共用同一套兜底链（本合约 → 当日主力 → 同品种 → 上一份快照）。
+- 升级需 `dropDatabase("dfs://RQDATA.futu_contract")` 后重新执行 `rqInitDb()`（TSDB 不支持加列）。
+
+### v1.5.9（syncRqData）
+
+- `contract` 新增两列（18 → 20 列）：
+  - `variety_cn`（STRING）：品种中文名。优先级为 `rqVarietyCnNames` 字典（上期所/郑商所/能源中心）→ 中金所别名（`IF`/`IC`/`IH`/`IM`/`T`/`TF`/`TS`/`TL`）→ 从 RQData 中文简称去掉交割月与连续后缀（`豆一2701` → `豆一`）。连续合约也带品种名，例如 `RB88` → `螺纹钢`、`CF99` → `棉花`。
+  - `delivery_month`（MONTH）：交割月份，取合约代码里的 4 位年月（`RB2701` → `2027.01M`）；连续合约（`88`/`888`/`889`/`88A2`/`88A3`/`99`）无交割月，为 NULL。
+- 新增 `88A3`（次次主力连续）支持：`dominant_id` 取 `futures.get_dominant(rank=3)`，`name` 还原为「品种中文名 + 次次主力连续」，交易参数查询按连续合约跳过。
+- 修复连续合约品种名提取：`股指次次主力连续` 不再被截成 `股指次`。
+- 注意：TSDB 不支持加列，升级需 `dropDatabase("dfs://RQDATA.futu_contract")` 后重新执行 `rqInitDb()`。
+
+### v1.5.8（syncRqData）
+
+- `contract.name` 补齐中文合约名：RQData 只对大商所/中金所/广期所返回中文简称，上期所/郑商所/能源中心返回小写代码。新增 `rqVarietyCnNames`（品种代码 → 中文名）与 `rqFixNames`，按「品种中文名 + 交割月 / 连续后缀」还原，例如 `rb2701` → `螺纹钢2701`、`CF99` → `棉花指数连续`。已有中文名的品种保持原值不改。
+
+### v1.5.7（syncRqData）
+
+- `bar` 表移除两个无用列：`series`（恒为常量 `"C"`）与 `next_symbol`（RQData 不提供、始终为 NULL），列数 19 → 17。换月关系改由 `contract.dominant_id` 表达。
+- 注意：TSDB 不支持删列，升级需 `dropDatabase("dfs://RQDATA.futu_bar")` 后重新执行 `rqInitDb()`。
+
+### v1.5.6（syncRqData）
+
+- `dominant_id` 覆盖范围扩展：`88/888/889` 记为当日主力，`88A2` 记为当日次主力（新增 `rqSecondaryIds`，走 `futures.get_dominant(rank=2)`，逐品种查询；股指期货默认 rule 返回空时自动改用 `rule=1`），`99` 保持为空。
+- 交易参数的取值链同步调整为“本合约 → 当日主力 → 当日次主力 → 同品种主力 → 上一份快照”。
+
+### v1.3.1（RQData）
+
+- `rqFutDominant` 新增 `rank`（1-主力 / 2-次主力 / 3-次次主力）与 `rule`（主力切换规则）参数；股指期货取次主力须显式传 `rule=1`。
+
+### v1.5.5（syncRqData）
+
+- 新增 `rqTradingParams`，经 `futures.get_trading_parameters` 落库 `commission_num` / `commission_unit` / `max_order_vol`；`by_money` 费率 ×100 转百分数（对齐 HAZQ 口径）。
+- 连续合约（88/888/889/99/88A2）接口不返回交易参数，按“同日主力合约 → 同品种”兜底。
+- 修复合约 `variety` 提取规则：由“删除所有数字”改为“截到首个数字”，修复 `A88A2`（次主力连续）被解析成 `AA` 的问题。
+- 单测：`rqBuildContract` 增加 `tpVar` 入参。
+
+### v1.5.4（syncRqData）
+
+- 新增 `rqTickSizes`，日线同步时经 `get_tick_size` 补齐 `contract.pricetick`（只查候选合约，按 300 个/批请求）。
+- `margin_ratio` 落库前保留 6 位小数，修复 RQData 原始浮点值（如 `0.06999999999999999`）直接入库的问题。
 
 ### v1.5.3（syncRqData）
 

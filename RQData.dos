@@ -67,7 +67,7 @@ module RQData
  *   rqCapitalFlow(user, pwd, rqIds, startDate, endDate)
  *   rqShareTransformation(user, pwd)
  *
- * 版本: 1.3.0
+ * 版本: 1.3.1
  */
 
 // ============================================================================
@@ -80,7 +80,7 @@ def module_info() {
      */
     res = dict(STRING, ANY)
     res["moduleName"] = "RQData"
-    res["moduleVersion"] = "1.3.0"
+    res["moduleVersion"] = "1.3.1"
     res["isFree"] = true
     res["description"] = "DolphinDB RQData Module (Futures/Stock/Index/Fund HTTP API Wrapper)"
     return res
@@ -396,11 +396,14 @@ def rqFutContracts(uid, pwd, underlyingSymbol) {
 }
 
 // 主力合约（返回 date, dominant；注意不是主力连续合约价格）
-def rqFutDominant(uid, pwd, underlyingSymbol, startDate, endDate) {
+// rank: 1-主力 2-次主力 3-次次主力；rule: 主力切换规则，股指期货取次主力时需显式传 1 或 2
+def rqFutDominant(uid, pwd, underlyingSymbol, startDate, endDate, rank=1, rule=NULL) {
     p = dict(STRING, ANY)
     p["underlying_symbol"] = underlyingSymbol
     p["start_date"] = rqDateInt(startDate)
     p["end_date"] = rqDateInt(endDate)
+    p["rank"] = rank
+    if(!isVoid(rule)) p["rule"] = rule
     return rqCall(uid, pwd, "futures.get_dominant", p)
 }
 
