@@ -605,6 +605,21 @@ tb = RQData::rqGetPrice("license", "<License Key>", ["AU2412"], 2024.10.08, 2024
 
 ## 8. 版本更新说明 (Changelog)
 
+### v1.9.1（syncRqData）
+
+- 新增 `rqEnsureCalendar(user, pwd, needDate)`：**所有同步的第一步**先检查交易日历，最后一天不足「目标日 + 60 天」时才请求，一次拉两个月。RQData 的日历提前公布，因此之后两个月的同步只做本地判断、不产生网络请求。
+- `rqSyncIncremental` 开头统一执行「补齐目标区间日历 + 向前延伸 60 天」，日线、分钟线、`rqBackfillAll`、`rqBackfillMinute`、`rqDailyJob`、`rqMinuteJob` 全部路径都自动覆盖。
+- `rqFillCalendar` 默认结束日由 `today()` 改为 `today()+60`。
+- 实测：日历从 `2026.11.05` 延伸到 `2027.01.05`（新增 42 个交易日），再次调用返回 0 且无网络请求。
+
+### v1.9.0（syncRqData）
+
+- 品种中文名从代码内字典改为**外置维表** `dfs://RQDATA.futu_variety_cn`：新增 `rqVarietyCnBuiltin`（种子/兜底）、`rqVarietyCnTable`、`rqSeedVarietyCn`、`rqAddVarietyCn`。新品种上市增补一行数据即可，无需改代码重新部署。
+- 内置字典由 `rqVarietyCnNames` 改名为 `rqVarietyCnBuiltin`；`rqVarietyCnNames` 改为「外置表覆盖内置字典」的合并结果，旧调用方无需改动。
+- 同步时扫描 `variety_cn` 为空的品种，向 `synclog` 写 `status=WARN` 记录并打印告警，不再静默留空。
+- 实测确认 RQData 无品种中文名接口：`futures.get_variety_info`、`futures.get_varieties`、`get_varieties`、`futures.get_variety_list` 均返回 400，`all_instruments` 的 `type` 无 `FutureVariety` 选项。
+- 当前 98 个品种、11429 条合约的 `variety_cn` 空值为 0。
+
 ### v1.8.0（syncRqData）
 
 - 新增 `rqPlanBackfill(user, pwd, startDate, endDate, includeMinute)`：**不拉行情**的预算预估，输出每段交易日数、缺失天数与估算 GB，并对比当前剩余额度算出缺口。谈额度前先用它量数。

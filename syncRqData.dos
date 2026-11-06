@@ -60,7 +60,7 @@ module syncRqData
  *   rqDailyJob()                                     无参入口，供 scheduleJob 调用
  *   rqRegisterJob()                                  注册每日 17:00 定时任务
  *
- * 版本: 1.8.0
+ * 版本: 1.9.1
  */
 
 // ============================================================================
@@ -73,7 +73,7 @@ def module_info() {
      */
     res = dict(STRING, ANY)
     res["moduleName"] = "syncRqData"
-    res["moduleVersion"] = "1.8.0"
+    res["moduleVersion"] = "1.9.1"
     res["isFree"] = true
     res["description"] = "DolphinDB syncRqData Module (Futures ETL via RQData)"
     return res
@@ -111,6 +111,10 @@ def rqEmptySyncLog() {
         [STRING, STRING, STRING, STRING, DATE, DATE, LONG, STRING, STRING, NANOTIMESTAMP])
 }
 
+def rqEmptyVarietyCn() {
+    return table(1:0, `variety`variety_cn`update_time, [SYMBOL, STRING, NANOTIMESTAMP])
+}
+
 // ============================================================================
 // 1.1 建库建表（首次使用执行一次，重复执行无副作用）
 //     bar/contract 按 trade_date 月分区；分钟线与日线共用 bar 表，用 interval 区分
@@ -136,7 +140,13 @@ def rqInitDb() {
         dbLog = database("dfs://RQDATA.futu_synclog", VALUE, 2010.01M..2030.12M)
         dbLog.createPartitionedTable(table=rqEmptySyncLog(), tableName="data", partitionColumns=`start_date)
     }
-    print("[RQ] 建库建表完成（RQDATA.futu_bar / futu_contract / futu_calendar / futu_synclog）")
+    // 品种中文名维表：RQData 无对应接口，中文名需本地维护，建成可运行时增补的维表
+    // 建表后可选执行 rqSeedVarietyCn() 把内置字典落表，便于集中维护
+    if(!existsDatabase("dfs://RQDATA.futu_variety_cn")) {
+        dbVar = database("dfs://RQDATA.futu_variety_cn", HASH, [SYMBOL, 2])
+        dbVar.createPartitionedTable(table=rqEmptyVarietyCn(), tableName="data", partitionColumns=`variety)
+    }
+    print("[RQ] 建库建表完成（RQDATA.futu_bar / futu_contract / futu_calendar / futu_synclog / futu_variety_cn）")
     return true
 }
 
@@ -216,10 +226,13 @@ def rqLog(jobName, dataType, exchange, interval, startDate, endDate, rowCount, s
 }
 
 // ============================================================================
-// 5. 品种中文名（RQData 仅对大商所/中金所/广期所返回中文简称，
-//    上期所/郑商所/能源中心只返回小写代码，需在此补齐）
+// 5. 品种中文名
+//    RQData 没有品种中文名接口（futures.get_variety_info / get_varieties 等均不存在），
+//    all_instruments 的 symbol 仅大商所/中金所返回中文，上期所/郑商所/能源中心只给代码。
+//    因此中文名外置到 dfs://RQDATA.futu_variety_cn，运行时可增补；
+//    下面的内置字典仅作首次种子与兜底，新品种通过 rqAddVarietyCn 补充，无需改代码。
 // ============================================================================
-def rqVarietyCnNames() {
+def rqVarietyCnBuiltin() {
     d = dict(STRING, STRING)
     // 上期所
     d["AD"] = "铸造铝合金"; d["AG"] = "白银";   d["AL"] = "铝";       d["AO"] = "氧化铝"
@@ -241,6 +254,54 @@ def rqVarietyCnNames() {
     d["BC"] = "国际铜"; d["EC"] = "集运指数欧线"; d["LU"] = "低硫燃料油"
     d["NR"] = "20号胶"; d["SC"] = "原油"
     return d
+}
+
+// 外置品种中文名表；表或库不存在时返回空表，保证旧库仍可运行
+def rqVarietyCnTable() {
+    t = table(1:0, `variety`variety_cn, [SYMBOL, STRING])
+    try {
+        if(existsTable("dfs://RQDATA.futu_variety_cn", "data")) t = rqLoad("variety_cn")
+    } catch(ex) { }
+    return select variety, variety_cn from t
+}
+
+// 品种中文名：外置表优先覆盖内置字典
+def rqVarietyCnNames() {
+    d = rqVarietyCnBuiltin()
+    t = rqVarietyCnTable()
+    for(i in 0:t.rows()) {
+        d[string(t.variety[i])] = t.variety_cn[i]
+    }
+    return d
+}
+
+// 首次建库时用内置字典初始化外置表（幂等：表内已有数据则跳过）
+def rqSeedVarietyCn() {
+    try {
+        t = rqLoad("variety_cn")
+        // DFS 表的 rows() 不可靠，必须用 count(*) 判断是否已初始化
+        if(exec count(*) from t > 0) return 0
+        d = rqVarietyCnBuiltin()
+        ks = keys(d)
+        t.append!(table(ks as variety, d[ks] as variety_cn,
+                        take(nanotimestamp(now()), ks.size()) as update_time))
+        print("[RQ] 品种中文名已初始化 " + string(ks.size()) + " 条")
+        return ks.size()
+    } catch(ex) {
+        print("[RQ] 初始化品种中文名失败: " + ex[1])
+        return -1
+    }
+}
+
+// 运行时增补品种中文名（支持批量），新品种上市执行一次即可，无需改模块代码
+def rqAddVarietyCn(varieties, varietyCn) {
+    t = rqLoad("variety_cn")
+    try { delete from t where variety in varieties; } catch(ex) { }
+    t.append!(table(varieties as variety, varietyCn as variety_cn,
+                    take(nanotimestamp(now()), varieties.size()) as update_time))
+    print("[RQ] 已补充品种中文名 " + string(varieties.size()) + " 条: " +
+          concat(varieties + "=" + varietyCn, ", "))
+    return true
 }
 
 // 连续合约的中文后缀，与 RQData 自带命名保持一致（如 豆一主力连续价差平滑）
@@ -839,6 +900,15 @@ def rqSyncBars(user, pwd, startDate, endDate, frequency="1d", batchSize=50) {
     }
     idMap = dict(inst.symbol, inst.rq_id)
 
+    // 未识别品种告警：RQData 无品种中文名接口，新品种需用 rqAddVarietyCn 补充，
+    // 否则这些品种的 variety_cn 会静默留空
+    unk = exec distinct variety from inst where isNull(variety_cn) or variety_cn == ""
+    if(unk.size() > 0) {
+        msg = "以下品种缺少中文名，请执行 rqAddVarietyCn 补充: " + concat(string(unk), ", ")
+        print("[RQ] 警告：" + msg)
+        rqLog("rqSyncBars", "variety_cn", "ALL", frequency, startDate, endDate, 0, "WARN", msg)
+    }
+
     // 上一份合约快照（用于继承 margin_ratio / pricetick / commission_num 等）
     // 只取 startDate 之前最近的一份，避免历史回补时继承到“未来”的保证金率
     prev = table(1:0, `symbol`margin_ratio`max_order_vol`commission_unit`pricetick`commission_num`client_limit,
@@ -1025,6 +1095,24 @@ def rqSyncCalendar(user, pwd, startDate, endDate) {
     return k
 }
 
+// 交易日历向前延伸：日历最后一天不足「目标日 + 60 天」时才请求，
+// 一次拉两个月（RQData 提前公布未来日历），之后两个月的同步都只做本地判断
+def rqEnsureCalendar(user, pwd, needDate=NULL) {
+    need = needDate
+    if(isVoid(need)) need = today()
+    horizon = need + 60
+
+    lastD = exec max(trade_date) from rqLoad("calendar")
+    if(!isNull(lastD) && lastD >= horizon) return 0
+
+    // 从库里最后一天的下一天开始拉，避免重复；日历为空时从目标日前 30 天起
+    startD = lastD + 1
+    if(isNull(lastD)) startD = need - 30
+    n = rqSyncCalendar(user, pwd, startD, horizon)
+    print("[RQ] 交易日历已延伸至 " + string(horizon) + "，新增 " + string(n) + " 个交易日")
+    return n
+}
+
 // ============================================================================
 // 10.1 增量日期判定：只拉库里缺的交易日，已完整的直接跳过（省配额）
 // ============================================================================
@@ -1097,8 +1185,12 @@ def rqSyncIncremental(user, pwd, frequency, startDate, endDate, batchSize=50, re
     }
     if(startDate > endDate) return 0
 
+    // 所有同步的第一步：补齐目标区间的交易日历，并向前延伸 60 天
+    // （RQData 日历提前公布，一次拉两个月，之后两个月的同步都可跳过网络请求）
     try { rqSyncCalendar(user, pwd, startDate, endDate) }
     catch(ex) { print("[RQ] 交易日历同步失败，按库内现有日历判断: " + ex[1]) }
+    try { rqEnsureCalendar(user, pwd) }
+    catch(ex) { print("[RQ] 交易日历延伸失败: " + ex[1]) }
 
     cal = rqLoad("calendar")
     allDates = exec trade_date from cal where trade_date between startDate : endDate order by trade_date
@@ -1177,7 +1269,8 @@ def rqDailyJob() {
 // 12.0 交易日历全量填充：所有回补、增量判断、预算预估的前提，开销仅几十 KB
 def rqFillCalendar(user, pwd, startDate=2010.01.01, endDate=NULL) {
     endD = endDate
-    if(isVoid(endD)) endD = today()
+    // 默认拉到 today()+60：RQData 的交易日历提前公布，一次拉满未来两个月
+    if(isVoid(endD)) endD = today() + 60
     n = rqSyncCalendar(user, pwd, startDate, endD)
     cal = rqLoad("calendar")
     r = select min(trade_date) as d0, max(trade_date) as d1, count(*) as n from cal

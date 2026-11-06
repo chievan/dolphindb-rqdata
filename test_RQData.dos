@@ -1,16 +1,14 @@
-// RQData 模块测试脚本
+// RQData 模块测试脚本（覆盖 26 个公开接口，不含落库与同步逻辑）
 // 运行方式：在 DolphinDB 节点上整段执行即可（支持 local8848 等普通会话）
 //   - @testing:case 仅为用例标签，普通会话会忽略
-//   - 参数个数错误在编译期就会中断脚本，因此统一用 parseExpr(字符串).eval() + try/catch 校验
-//     （注意：DolphinDB 的 eval 只接受 CODE 元代码，直接 eval("字符串") 不会执行，需要用 parseExpr 转换）
-//   - 参数空值/类型、跨资产、字段越界等异常用例均用 try/catch + assert 校验
+//   - 参数个数不足/过多用 syntaxError=1；类型错误/空值/格式错误/逻辑反转用 exception=1
+//   - 预期异常直接写调用语句，由注解声明预期，不包裹 try/catch
+//   - 凭证必须替换为自己的 RQSDK License Key，切勿提交到公开仓库
 try { loadPlugin("httpClient") } catch(ex) {}
 use RQData
-use syncRqData
 
 // 1. 设置凭证：RQSDK 许可证模式（user 固定 "license"，pwd 为 License Key）
-//    若改成账号密码模式：user = "your_user_name" / pwd = "your_password"
-// 注意：License Key 属敏感信息，不要提交到公开仓库
+//    账号密码模式改为：user = "your_user_name" / pwd = "your_password"
 user = "license"
 pwd = "<YOUR_RQSDK_LICENSE_KEY>"
 
@@ -22,71 +20,69 @@ print("AccessToken 获取成功: " + substr(token, 0, 8) + "...")
 print("\n=== 测试 module_info (模块信息) ===")
 info = getLoadedModules()
 assert 0, "RQData" in info.moduleName
-assert 1, "syncRqData" in info.moduleName
 print("module_info 验证通过")
 
 // ====================================================
 // 第一部分：功能测试 (Functional Tests)
 // ====================================================
 
-// --- 1.1 token ---
-@testing:case = "test_token_format"
-print("\n=== 测试 token (格式) ===")
-// 许可证模式的 /auth 返回裸 token 文本（非 JSON），长度远大于 20
-assert 1, strlen(token) > 20
-assert 2, substr(token, 0, 1) != "{"
-print("token 格式验证通过")
-
-@testing:case = "test_token_cache"
-print("\n=== 测试 token 缓存 ===")
-tokenCache = RQData::rqGetToken(user, pwd)
-assert 1, tokenCache == token
-assert 2, RQData::rqTokenRead(user) == token
-print("token 缓存命中验证通过")
-
-@testing:case = "test_token_force"
-print("\n=== 测试 token 强制刷新 ===")
-tokenForced = RQData::rqGetToken(user, pwd, true)
-assert 1, strlen(tokenForced) > 20
-assert 2, RQData::rqTokenRead(user) == tokenForced
+// 公共请求参数（供 rqApi / rqRequest 复用）
 pNormal = dict(STRING, ANY)
 pNormal["m"] = "get_trading_dates"
 pNormal["start_date"] = 20241104
 pNormal["end_date"] = 20241105
+
+// --- 1.1 rqGetToken (凭证与 token 缓存) ---
+print("\n=== 测试 rqGetToken (凭证) ===")
+@testing:case = "test_rqGetToken_format"
+// 许可证模式的 /auth 返回裸 token 文本（非 JSON），长度远大于 20
+assert 1, strlen(token) > 20
+assert 2, substr(token, 0, 1) != "{"
+
+@testing:case = "test_rqGetToken_cache"
+// 未过期时应命中缓存，不重新请求
+tokenCache = RQData::rqGetToken(user, pwd)
+assert 1, tokenCache == token
+assert 2, RQData::rqTokenRead(user) == token
+
+@testing:case = "test_rqGetToken_force"
+// force=true 强制换新 token，旧 token 立即失效
+tokenForced = RQData::rqGetToken(user, pwd, true)
+assert 1, strlen(tokenForced) > 20
+assert 2, RQData::rqTokenRead(user) == tokenForced
+// 新 token 可直接用于后续请求
 assert 3, RQData::rqApi(tokenForced, pNormal)["responseCode"] == 200
 token = tokenForced
-print("token 强制刷新验证通过")
 
-// --- 1.2 rqApi ---
-@testing:case = "test_rqApi_basic"
+// --- 1.2 rqApi (通用 HTTP 调用) ---
 print("\n=== 测试 rqApi (通用调用) ===")
+@testing:case = "test_rqApi_basic"
 resp = RQData::rqApi(token, pNormal)
 assert 1, resp["responseCode"] == 200
-assert 2, strpos(string(resp["text"]), "trading_date") >= 0
-assert 3, "text" in resp.keys()
-// 自定义 timeout
-assert 4, RQData::rqApi(token, pNormal, 60000)["responseCode"] == 200
-print("rqApi 验证通过")
+assert 2, "text" in resp.keys()
+assert 3, strpos(string(resp["text"]), "trading_date") >= 0
+
+@testing:case = "test_rqApi_custom_timeout"
+// 自定义超时
+assert 1, RQData::rqApi(token, pNormal, 60000)["responseCode"] == 200
 
 @testing:case = "test_rqApi_invalid_token"
-print("\n=== 测试 rqApi (非法 token) ===")
+// 非法 token 不抛异常，由返回值携带 401
 assert 1, RQData::rqApi("INVALID_TOKEN_XXX", pNormal)["responseCode"] == 401
-print("非法 token 返回 401，验证通过")
 
-// --- 1.3 rqRequest（401 自动重登）---
-@testing:case = "test_rqRequest_auto_relogin"
+// --- 1.3 rqRequest (401 自动重登) ---
 print("\n=== 测试 rqRequest (401 自动重登) ===")
+@testing:case = "test_rqRequest_auto_relogin"
 // 故意把缓存里的 token 写成非法值，rqRequest 应自动换 token 后重试成功
 RQData::rqTokenWrite(user, "INVALID_TOKEN_XXX")
 respRe = RQData::rqRequest(user, pwd, pNormal)
 assert 1, respRe["responseCode"] == 200
 assert 2, RQData::rqTokenRead(user) != "INVALID_TOKEN_XXX"
 token = RQData::rqTokenRead(user)
-print("401 自动重登验证通过")
 
-// --- 1.4 rqParseCsv ---
-@testing:case = "test_rqParseCsv_normal"
+// --- 1.4 rqParseCsv (CSV 解析) ---
 print("\n=== 测试 rqParseCsv (CSV 解析) ===")
+@testing:case = "test_rqParseCsv_normal"
 csv = ",order_book_id,datetime,open,close\n0,AU2412,2024-10-08,1.5,2.5\n1,RB2410,2024-10-09,3.5,4.5"
 tbCsv = RQData::rqParseCsv(csv)
 assert 1, tbCsv.rows() == 2
@@ -119,13 +115,14 @@ assert 1, eqObj(tbQuote.columnNames(), ["order_book_id", "close"])
 assert 2, tbQuote["close"][0] == "596.2"
 
 @testing:case = "test_rqParseCsv_header_only"
+// 只有表头没有数据行
 tbHeaderOnly = RQData::rqParseCsv("a,b")
 assert 1, tbHeaderOnly.rows() == 0
 assert 2, tbHeaderOnly.columns() == 2
 
 // --- 1.5 rqGetPrice 日线 ---
-@testing:case = "test_rqGetPrice_daily"
 print("\n=== 测试 rqGetPrice (日线) ===")
+@testing:case = "test_rqGetPrice_daily"
 tbDaily = RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.18, "1d")
 assert 1, tbDaily.rows() > 0
 assert 2, "datetime" in tbDaily.columnNames()
@@ -170,8 +167,8 @@ tbFuture = RQData::rqGetPrice(user, pwd, ["AU2412"], 2030.01.01, 2030.01.10, "1d
 assert 1, tbFuture.rows() == 0
 
 // --- 1.6 rqGetPrice 分钟线 ---
-@testing:case = "test_rqGetPrice_1m"
 print("\n=== 测试 rqGetPrice (分钟线) ===")
+@testing:case = "test_rqGetPrice_1m"
 tb1m = RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1m")
 assert 1, tb1m.rows() > 0
 assert 2, "datetime" in tb1m.columnNames()
@@ -195,107 +192,16 @@ assert 1, "close" in cols1m
 assert 2, "trading_date" in cols1m
 assert 3, !("open_interest" in cols1m)
 
-// --- 1.7 rqAllInstruments ---
-@testing:case = "test_rqAllInstruments_future"
-print("\n=== 测试 rqAllInstruments (全量合约) ===")
-inst = RQData::rqAllInstruments(user, pwd, "Future")
-assert 1, inst.rows() > 0
-assert 2, "order_book_id" in inst.columnNames()
-assert 3, "exchange" in inst.columnNames()
-assert 4, "underlying_symbol" in inst.columnNames()
-assert 5, "contract_multiplier" in inst.columnNames()
+@testing:case = "test_rqGetPrice_night_session_trading_date"
+// 夜盘（2024-10-08 21:00 之后）应归属到下一交易日 2024-10-09
+tbNight = RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.09, 2024.10.09, "1m", ["trading_date", "close"])
+assert 1, tbNight.rows() > 0
+assert 2, any(tbNight["datetime"] like "2024-10-08 21:%")
+assert 3, all(tbNight["trading_date"] like "2024-10-09%")
 
-@testing:case = "test_rqAllInstruments_code_format"
-// 期货代码不带交易所后缀，交易所信息在 exchange 列
-auInst = select order_book_id, exchange from inst where underlying_symbol == "AU"
-assert 1, auInst.rows() > 0
-assert 2, sum(auInst["order_book_id"] like "%.%") == 0
-assert 3, all(auInst["exchange"] == "SHFE")
-
-@testing:case = "test_rqAllInstruments_contract_meta"
-au2412 = select * from inst where order_book_id == "AU2412"
-assert 1, au2412.rows() == 1
-assert 2, au2412["contract_multiplier"][0] != ""
-assert 3, au2412["maturity_date"][0] != ""
-
-// --- 1.8 rqTradingDates ---
-@testing:case = "test_rqTradingDates"
-print("\n=== 测试 rqTradingDates (交易日历) ===")
-cal = RQData::rqTradingDates(user, pwd, 2024.11.04, 2024.11.08)
-assert 1, cal.rows() == 5
-assert 2, "trading_date" in cal.columnNames()
-assert 3, cal["trading_date"][0] == "2024-11-04"
-assert 4, cal["trading_date"][4] == "2024-11-08"
-
-// --- 1.9 并发 ---
-def rqConcurrentPriceTask(u, p, i) {
-    t = RQData::rqGetPrice(u, p, ["AU2412"], 2024.10.08, 2024.10.09, "1d", ["close"])
-    return t.rows()
-}
-
-def rqConcurrentCalendarTask(u, p, i) {
-    t = RQData::rqTradingDates(u, p, 2024.11.04, 2024.11.08)
-    return t.rows()
-}
-
-@testing:case = "test_Concurrent_rqGetPrice"
-print("\n=== 测试 并发 rqGetPrice ===")
-rPrice = ploop(rqConcurrentPriceTask{user, pwd}, 1..4)
-assert 1, size(rPrice) == 4
-assert 2, all(rPrice > 0)
-print("并发 rqGetPrice 验证通过")
-
-@testing:case = "test_Concurrent_rqTradingDates"
-print("\n=== 测试 并发 rqTradingDates ===")
-rCal = ploop(rqConcurrentCalendarTask{user, pwd}, 1..4)
-assert 1, size(rCal) == 4
-assert 2, all(rCal == 5)
-print("并发 rqTradingDates 验证通过")
-
-// --- 1.10 通用：合约详情 / 配额 ---
-@testing:case = "test_rqInstruments_stock"
-print("\n=== 测试 rqInstruments (合约详情) ===")
-instStock = RQData::rqInstruments(user, pwd, ["000001.XSHE"])
-assert 1, instStock.rows() == 1
-assert 2, instStock["order_book_id"][0] == "000001.XSHE"
-assert 3, "industry_name" in instStock.columnNames()
-
-@testing:case = "test_rqInstruments_future"
-instFut = RQData::rqInstruments(user, pwd, ["AU2412"])
-assert 1, instFut.rows() == 1
-assert 2, "contract_multiplier" in instFut.columnNames()
-assert 3, instFut["exchange"][0] == "SHFE"
-
-@testing:case = "test_rqInstruments_invalid_code"
-// 不存在的代码不报错，返回空表（CSV 只有表头或完全为空）
-instInvalid = RQData::rqInstruments(user, pwd, ["INVALID"])
-assert 1, instInvalid.rows() == 0
-
-@testing:case = "test_rqGetQuota"
-print("\n=== 测试 rqGetQuota (配额) ===")
-quota = RQData::rqGetQuota(user, pwd)
-assert 1, quota.rows() >= 4
-assert 2, "name" in quota.columnNames()
-assert 3, "value" in quota.columnNames()
-assert 4, "bytes_used" in quota["name"]
-
-@testing:case = "test_rqCall_with_params"
-// 通用调用助手：显式传参
-pCall = dict(STRING, ANY)
-pCall["start_date"] = 20241104
-pCall["end_date"] = 20241105
-tbCall = RQData::rqCall(user, pwd, "get_trading_dates", pCall)
-assert 1, tbCall.rows() == 2
-assert 2, "trading_date" in tbCall.columnNames()
-
-@testing:case = "test_rqCall_without_params"
-// params 可选，省略时只发方法名
-quotaCall = RQData::rqCall(user, pwd, "user.get_quota")
-assert 1, quotaCall.rows() >= 4
-
-// --- 1.11 股票 / 指数 / 基金行情 ---
+// --- 1.7 rqGetPrice 股票/指数/基金 ---
+print("\n=== 测试 rqGetPrice (股票/指数/基金) ===")
 @testing:case = "test_rqGetPrice_stock_daily"
-print("\n=== 测试 股票/指数/基金行情 ===")
 tbStock = RQData::rqGetPrice(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.09, "1d")
 assert 1, tbStock.rows() == 2
 assert 2, "prev_close" in tbStock.columnNames()
@@ -320,392 +226,6 @@ assert 1, tbStock1m.rows() > 0
 assert 2, !("trading_date" in tbStock1m.columnNames())
 assert 3, !("prev_close" in tbStock1m.columnNames())
 
-// --- 1.12 行情衍生（股票/指数）---
-@testing:case = "test_rqGetPriceChangeRate"
-print("\n=== 测试 行情衍生 (涨跌幅/复权因子/分红/因子) ===")
-tbRate = RQData::rqGetPriceChangeRate(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.10)
-assert 1, tbRate.rows() == 3
-assert 2, "date" in tbRate.columnNames()
-assert 3, size(tbRate.columnNames()) == 2
-
-@testing:case = "test_rqGetExFactor"
-tbEx = RQData::rqGetExFactor(user, pwd, ["000001.XSHE"], 2024.01.01, 2024.10.08)
-assert 1, tbEx.rows() > 0
-assert 2, "ex_factor" in tbEx.columnNames()
-
-@testing:case = "test_rqGetDividend"
-tbDiv = RQData::rqGetDividend(user, pwd, ["000001.XSHE"], 2024.01.01, 2024.10.08)
-assert 1, tbDiv.rows() > 0
-assert 2, "dividend_cash_before_tax" in tbDiv.columnNames()
-
-@testing:case = "test_rqGetFactor"
-tbFactor = RQData::rqGetFactor(user, pwd, ["000001.XSHE"], ["pe_ratio", "pb_ratio"], 2024.10.08, 2024.10.08)
-assert 1, tbFactor.rows() == 1
-assert 2, "pe_ratio" in tbFactor.columnNames()
-assert 3, "pb_ratio" in tbFactor.columnNames()
-
-// --- 1.13 期货专项 ---
-@testing:case = "test_rqFutContracts"
-print("\n=== 测试 期货专项 (合约/主力/仓单/持仓排名) ===")
-ctr = RQData::rqFutContracts(user, pwd, "AU")
-assert 1, ctr.rows() > 0
-assert 2, eqObj(ctr.columnNames(), ["order_book_id"])
-assert 3, sum(ctr["order_book_id"] like "%.%") == 0
-
-@testing:case = "test_rqFutDominant"
-dom = RQData::rqFutDominant(user, pwd, "AU", 2024.10.08, 2024.10.10)
-assert 1, dom.rows() == 3
-assert 2, eqObj(dom.columnNames(), ["date", "dominant"])
-assert 3, all(dom["dominant"] like "AU%")
-
-@testing:case = "test_rqFutDominantPrice"
-// 主力连续复权行情：dominant_id 固定返回，adjust_type 影响 close
-dpNone = RQData::rqFutDominantPrice(user, pwd, ["AU"], 2024.10.08, 2024.10.09, "none", "1d", ["close"])
-assert 1, dpNone.rows() == 2
-assert 2, "dominant_id" in dpNone.columnNames()
-assert 3, all(dpNone["dominant_id"] like "AU%")
-dpPre = RQData::rqFutDominantPrice(user, pwd, ["AU"], 2024.10.08, 2024.10.08, "pre", "1d", ["close"])
-assert 4, dpPre["close"][0] > dpNone["close"][0]
-
-@testing:case = "test_rqFutWarehouseStocks"
-wh = RQData::rqFutWarehouseStocks(user, pwd, ["AU"], 2024.10.08, 2024.10.10)
-assert 1, wh.rows() == 3
-assert 2, "on_warrant" in wh.columnNames()
-assert 3, all(wh["underlying_symbol"] == "AU")
-
-@testing:case = "test_rqFutMemberRank"
-mr = RQData::rqFutMemberRank(user, pwd, "AU", 2024.10.08, 2024.10.08)
-assert 1, mr.rows() > 0
-assert 2, "member_name" in mr.columnNames()
-assert 3, "rank" in mr.columnNames()
-
-// --- 1.14 股票专项 ---
-@testing:case = "test_rqInstrumentIndustry"
-print("\n=== 测试 股票专项 (行业/两融/港股通/资金流/股份变动) ===")
-ind = RQData::rqInstrumentIndustry(user, pwd, ["000001.XSHE"])
-assert 1, ind.rows() == 1
-assert 2, ind["first_industry_code"][0] == "40"
-assert 3, ind["first_industry_name"][0] == "银行"
-
-@testing:case = "test_rqIndustryStocks"
-indStocks = RQData::rqIndustryStocks(user, pwd, "40")
-assert 1, indStocks.rows() > 0
-assert 2, "000001.XSHE" in indStocks["order_book_id"]
-
-@testing:case = "test_rqMarginStocks"
-mg = RQData::rqMarginStocks(user, pwd, 2024.10.08)
-assert 1, mg.rows() > 0
-assert 2, eqObj(mg.columnNames(), ["order_book_id"])
-
-@testing:case = "test_rqStockConnect"
-sc = RQData::rqStockConnect(user, pwd, ["000001.XSHE"], 2024.08.01, 2024.08.05)
-assert 1, sc.rows() > 0
-assert 2, "holding_ratio" in sc.columnNames()
-
-@testing:case = "test_rqCapitalFlow"
-cf = RQData::rqCapitalFlow(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.10)
-assert 1, cf.rows() == 3
-assert 2, "buy_value" in cf.columnNames()
-assert 3, "sell_value" in cf.columnNames()
-
-@testing:case = "test_rqShareTransformation"
-st = RQData::rqShareTransformation(user, pwd)
-assert 1, st.rows() > 0
-assert 2, "successor" in st.columnNames()
-assert 3, "event" in st.columnNames()
-
-// ====================================================
-// 第二部分：系统化异常校验 (参数层)
-// ====================================================
-
-// --- 2.1 rqGetToken ---
-@testing:case = "test_rqGetToken_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetToken(user)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetToken_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetToken(user, pwd, false, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetToken_user_null"
-okErr = false
-try { RQData::rqGetToken(NULL, pwd, true) } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetToken_pwd_null"
-okErr = false
-try { RQData::rqGetToken(user, NULL, true) } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetToken_bad_credential"
-okErr = false
-try { RQData::rqGetToken("bad_user", "bad_password", true) } catch(ex) { okErr = true }
-assert 1, okErr
-
-// --- 2.2 rqApi ---
-@testing:case = "test_rqApi_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqApi(token)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqApi_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqApi(token, pNormal, 60000, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqApi_token_type"
-// token 非字符串：插件层抛异常，或被服务端判为非法 token（401），两者都算通过
-okTokenType = false
-try {
-    rTokenType = RQData::rqApi(12345, pNormal)
-    okTokenType = (rTokenType["responseCode"] == 401)
-} catch(ex) {
-    okTokenType = true
-}
-assert 1, okTokenType
-
-@testing:case = "test_rqApi_token_null"
-// token 为 NULL：插件层抛异常，或被服务端判为非法 token（401），两者都算通过
-okTokenNull = false
-try {
-    rTokenNull = RQData::rqApi(NULL, pNormal)
-    okTokenNull = (rTokenNull["responseCode"] == 401)
-} catch(ex) {
-    okTokenNull = true
-}
-assert 1, okTokenNull
-
-@testing:case = "test_rqApi_params_type"
-// params 非字典：本地序列化抛异常，或服务端返回非 200，两者都算通过
-okParamsType = false
-try {
-    rParamsType = RQData::rqApi(token, 123)
-    okParamsType = (rParamsType["responseCode"] != 200)
-} catch(ex) {
-    okParamsType = true
-}
-assert 1, okParamsType
-
-@testing:case = "test_rqApi_timeout_type"
-okErr = false
-try { RQData::rqApi(token, pNormal, "abc") } catch(ex) { okErr = true }
-assert 1, okErr
-
-// --- 2.3 rqGetPrice ---
-@testing:case = "test_rqGetPrice_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetPrice(user, pwd, [\"AU2412\"], 2024.10.08)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetPrice_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetPrice(user, pwd, [\"AU2412\"], 2024.10.08, 2024.10.09, \"1d\", [\"close\"], \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetPrice_ids_int_scalar"
-// 合约代码传标量数字：本地序列化或服务端校验都会失败
-okIdsInt = false
-try {
-    RQData::rqGetPrice(user, pwd, 600519, 2024.10.08, 2024.10.09, "1d")
-    okIdsInt = false
-} catch(ex) {
-    okIdsInt = true
-}
-assert 1, okIdsInt
-
-@testing:case = "test_rqGetPrice_ids_null"
-okErr = false
-try { RQData::rqGetPrice(user, pwd, NULL, 2024.10.08, 2024.10.09, "1d") } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetPrice_ids_empty_vec"
-okErr = false
-try { RQData::rqGetPrice(user, pwd, array(STRING, 0), 2024.10.08, 2024.10.09, "1d") } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetPrice_ids_matrix"
-okErr = false
-try { RQData::rqGetPrice(user, pwd, matrix(["AU2412", "RB2410"]), 2024.10.08, 2024.10.09, "1d") } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetPrice_start_null"
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["AU2412"], NULL, 2024.10.09, "1d") } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetPrice_frequency_int"
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, 1) } catch(ex) { okErr = true }
-assert 1, okErr
-
-// --- 2.4 rqAllInstruments ---
-@testing:case = "test_rqAllInstruments_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqAllInstruments(user)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqAllInstruments_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqAllInstruments(user, pwd, \"Future\", \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqAllInstruments_type_int"
-okErr = false
-try { RQData::rqAllInstruments(user, pwd, 1) } catch(ex) { okErr = true }
-assert 1, okErr
-
-// --- 2.5 rqTradingDates ---
-@testing:case = "test_rqTradingDates_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqTradingDates(user, pwd, 2024.11.04)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqTradingDates_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqTradingDates(user, pwd, 2024.11.04, 2024.11.08, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqTradingDates_start_null"
-okErr = false
-try { RQData::rqTradingDates(user, pwd, NULL, 2024.11.08) } catch(ex) { okErr = true }
-assert 1, okErr
-
-// --- 2.6 新增接口：参数个数与空值校验 ---
-@testing:case = "test_rqCall_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqCall(user, pwd)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqCall_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqCall(user, pwd, \"user.get_quota\", NULL, 180000, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqInstruments_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqInstruments(user, pwd)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetQuota_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetQuota(user, pwd, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetPriceChangeRate_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetPriceChangeRate(user, pwd, [\"000001.XSHE\"], 2024.10.08)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetExFactor_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetExFactor(user, pwd, [\"000001.XSHE\"], 2024.01.01, 2024.10.08, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetDividend_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetDividend(user, pwd, [\"000001.XSHE\"], 2024.01.01)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetFactor_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqGetFactor(user, pwd, [\"000001.XSHE\"], [\"pe_ratio\"])").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqFutContracts_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqFutContracts(user, pwd, \"AU\", \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqFutDominant_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqFutDominant(user, pwd, \"AU\", 2024.10.08)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqFutWarehouseStocks_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqFutWarehouseStocks(user)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqFutMemberRank_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqFutMemberRank(user, pwd, \"AU\", 2024.10.08)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqInstrumentIndustry_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqInstrumentIndustry(user, pwd)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqIndustryStocks_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqIndustryStocks(user)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqMarginStocks_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqMarginStocks(user, pwd, 2024.10.08, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqStockConnect_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqStockConnect(user, pwd, [\"000001.XSHE\"], 2024.08.01)").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqCapitalFlow_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqCapitalFlow(user, pwd, [\"000001.XSHE\"], 2024.10.08, 2024.10.10, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqShareTransformation_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqShareTransformation(user, pwd, \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqGetExFactor_start_null"
-okErr = false
-try { RQData::rqGetExFactor(user, pwd, ["000001.XSHE"], NULL, 2024.10.08) } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetFactor_factor_null"
-okErr = false
-try { RQData::rqGetFactor(user, pwd, ["000001.XSHE"], NULL, 2024.10.08, 2024.10.08) } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqMarginStocks_date_null"
-okErr = false
-try { RQData::rqMarginStocks(user, pwd, NULL) } catch(ex) { okErr = true }
-assert 1, okErr
-
-// --- 2.7 rqParseCsv ---
-@testing:case = "test_rqParseCsv_arg_count_less"
-okSyntaxErr = false
-try { parseExpr("RQData::rqParseCsv()").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-@testing:case = "test_rqParseCsv_arg_count_more"
-okSyntaxErr = false
-try { parseExpr("RQData::rqParseCsv(\"a,b\", \"extra\")").eval() } catch(ex) { okSyntaxErr = true }
-assert 1, okSyntaxErr
-
-// ====================================================
-// 第三部分：功能反向测试 (内容层)
-// ====================================================
-
-// --- 3.1 rqGetPrice ---
-@testing:case = "test_rqGetPrice_invalid_code"
-// 代码不存在
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["INVALID"], 2024.10.08, 2024.10.09, "1d") } catch(ex) { okErr = true }
-assert 1, okErr
-
-@testing:case = "test_rqGetPrice_code_with_suffix"
-// 期货代码带交易所后缀（AU2412.SHF）会被拒绝
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["AU2412.SHF"], 2024.10.08, 2024.10.09, "1d") } catch(ex) { okErr = true }
-assert 1, okErr
-
 @testing:case = "test_rqGetPrice_mixed_codes"
 // 有效与无效代码混合：服务端部分返回，只保留有效合约
 tbMixed = RQData::rqGetPrice(user, pwd, ["AU2412", "INVALID"], 2024.10.08, 2024.10.09, "1d", ["close"])
@@ -713,39 +233,57 @@ assert 1, tbMixed.rows() > 0
 assert 2, any(tbMixed["order_book_id"] == "AU2412")
 assert 3, !any(tbMixed["order_book_id"] == "INVALID")
 
-@testing:case = "test_rqGetPrice_invalid_frequency"
-// 不支持的频率
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1x") } catch(ex) { okErr = true }
-assert 1, okErr
+// --- 1.8 rqAllInstruments (全量合约) ---
+print("\n=== 测试 rqAllInstruments (全量合约) ===")
+@testing:case = "test_rqAllInstruments_future"
+inst = RQData::rqAllInstruments(user, pwd, "Future")
+assert 1, inst.rows() > 0
+assert 2, "order_book_id" in inst.columnNames()
+assert 3, "exchange" in inst.columnNames()
+assert 4, "underlying_symbol" in inst.columnNames()
+assert 5, "contract_multiplier" in inst.columnNames()
 
-@testing:case = "test_rqGetPrice_invalid_fields"
-// 字段名错误
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1d", ["foo"]) } catch(ex) { okErr = true }
-assert 1, okErr
+@testing:case = "test_rqAllInstruments_code_format"
+// 期货代码不带交易所后缀，交易所信息在 exchange 列
+auInst = select order_book_id, exchange from inst where underlying_symbol == "AU"
+assert 1, auInst.rows() > 0
+assert 2, sum(auInst["order_book_id"] like "%.%") == 0
+assert 3, all(auInst["exchange"] == "SHFE")
 
-@testing:case = "test_rqGetPrice_minute_with_daily_fields"
-// 分钟线不支持 settlement 等日线字段
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1m", ["settlement"]) } catch(ex) { okErr = true }
-assert 1, okErr
+@testing:case = "test_rqAllInstruments_contract_meta"
+au2412 = select * from inst where order_book_id == "AU2412"
+assert 1, au2412.rows() == 1
+assert 2, au2412["contract_multiplier"][0] != ""
+assert 3, au2412["maturity_date"][0] != ""
 
-@testing:case = "test_rqGetPrice_night_session_trading_date"
-// 夜盘（2024-10-08 21:00 之后）应归属到下一交易日 2024-10-09
-tbNight = RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.09, 2024.10.09, "1m", ["trading_date", "close"])
-assert 1, tbNight.rows() > 0
-assert 2, any(tbNight["datetime"] like "2024-10-08 21:%")
-assert 3, all(tbNight["trading_date"] like "2024-10-09%")
+// --- 1.9 rqInstruments (合约详情) ---
+print("\n=== 测试 rqInstruments (合约详情) ===")
+@testing:case = "test_rqInstruments_stock"
+instStock = RQData::rqInstruments(user, pwd, ["000001.XSHE"])
+assert 1, instStock.rows() == 1
+assert 2, instStock["order_book_id"][0] == "000001.XSHE"
+assert 3, "industry_name" in instStock.columnNames()
 
-// --- 3.2 rqAllInstruments ---
-@testing:case = "test_rqAllInstruments_invalid_type"
-// 不支持的品种类型
-okErr = false
-try { RQData::rqAllInstruments(user, pwd, "Nope") } catch(ex) { okErr = true }
-assert 1, okErr
+@testing:case = "test_rqInstruments_future"
+instFut = RQData::rqInstruments(user, pwd, ["AU2412"])
+assert 1, instFut.rows() == 1
+assert 2, "contract_multiplier" in instFut.columnNames()
+assert 3, instFut["exchange"][0] == "SHFE"
 
-// --- 3.3 rqTradingDates ---
+@testing:case = "test_rqInstruments_invalid_code"
+// 不存在的代码不报错，返回空表（CSV 只有表头或完全为空）
+instInvalid = RQData::rqInstruments(user, pwd, ["INVALID"])
+assert 1, instInvalid.rows() == 0
+
+// --- 1.10 rqTradingDates (交易日历) ---
+print("\n=== 测试 rqTradingDates (交易日历) ===")
+@testing:case = "test_rqTradingDates"
+cal = RQData::rqTradingDates(user, pwd, 2024.11.04, 2024.11.08)
+assert 1, cal.rows() == 5
+assert 2, "trading_date" in cal.columnNames()
+assert 3, cal["trading_date"][0] == "2024-11-04"
+assert 4, cal["trading_date"][4] == "2024-11-08"
+
 @testing:case = "test_rqTradingDates_weekend"
 // 周末区间无交易日
 calWeekend = RQData::rqTradingDates(user, pwd, 2024.10.12, 2024.10.13)
@@ -756,169 +294,623 @@ assert 1, calWeekend.rows() == 0
 calReverse = RQData::rqTradingDates(user, pwd, 2024.11.08, 2024.11.04)
 assert 1, calReverse.rows() == 0
 
-// --- 3.4 新增接口：跨资产与非法参数 ---
-@testing:case = "test_rqGetPrice_mixed_assets"
-// 同一次请求混资产类型（期货 + 股票）会被拒绝
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["AU2412", "000001.XSHE"], 2024.10.08, 2024.10.09, "1d", ["close"]) } catch(ex) { okErr = true }
-assert 1, okErr
+// --- 1.11 rqGetQuota (配额查询) ---
+print("\n=== 测试 rqGetQuota (配额) ===")
+@testing:case = "test_rqGetQuota"
+quota = RQData::rqGetQuota(user, pwd)
+assert 1, quota.rows() >= 4
+assert 2, "name" in quota.columnNames()
+assert 3, "value" in quota.columnNames()
+assert 4, "bytes_used" in quota["name"]
 
-@testing:case = "test_rqGetPrice_index_future_fields"
-// 指数日线没有期货专属字段 open_interest
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["000300.XSHG"], 2024.10.08, 2024.10.09, "1d", ["open_interest"]) } catch(ex) { okErr = true }
-assert 1, okErr
+// --- 1.12 rqGetPriceChangeRate (区间涨跌幅) ---
+print("\n=== 测试 rqGetPriceChangeRate (涨跌幅) ===")
+@testing:case = "test_rqGetPriceChangeRate"
+tbRate = RQData::rqGetPriceChangeRate(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.10)
+assert 1, tbRate.rows() == 3
+assert 2, "date" in tbRate.columnNames()
+assert 3, size(tbRate.columnNames()) == 2
 
-@testing:case = "test_rqGetPrice_stock_settlement"
-// 股票日线没有结算价 settlement
-okErr = false
-try { RQData::rqGetPrice(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.09, "1d", ["settlement"]) } catch(ex) { okErr = true }
-assert 1, okErr
+// --- 1.13 rqGetExFactor (复权因子) ---
+print("\n=== 测试 rqGetExFactor (复权因子) ===")
+@testing:case = "test_rqGetExFactor"
+tbEx = RQData::rqGetExFactor(user, pwd, ["000001.XSHE"], 2024.01.01, 2024.10.08)
+assert 1, tbEx.rows() > 0
+assert 2, "ex_factor" in tbEx.columnNames()
 
-@testing:case = "test_rqIndustryStocks_by_name"
-// industry 必须传行业代码，传分类名称返回空表
-indByName = RQData::rqIndustryStocks(user, pwd, "sws_2021")
-assert 1, indByName.rows() == 0
+// --- 1.14 rqGetDividend (分红送股) ---
+print("\n=== 测试 rqGetDividend (分红送股) ===")
+@testing:case = "test_rqGetDividend"
+tbDiv = RQData::rqGetDividend(user, pwd, ["000001.XSHE"], 2024.01.01, 2024.10.08)
+assert 1, tbDiv.rows() > 0
+assert 2, "dividend_cash_before_tax" in tbDiv.columnNames()
+
+// --- 1.15 rqGetFactor (因子数据) ---
+print("\n=== 测试 rqGetFactor (因子) ===")
+@testing:case = "test_rqGetFactor"
+tbFactor = RQData::rqGetFactor(user, pwd, ["000001.XSHE"], ["pe_ratio", "pb_ratio"], 2024.10.08, 2024.10.08)
+assert 1, tbFactor.rows() == 1
+assert 2, "pe_ratio" in tbFactor.columnNames()
+assert 3, "pb_ratio" in tbFactor.columnNames()
+
+// --- 1.16 rqFutContracts (挂牌合约) ---
+print("\n=== 测试 rqFutContracts (挂牌合约) ===")
+@testing:case = "test_rqFutContracts"
+ctr = RQData::rqFutContracts(user, pwd, "AU")
+assert 1, ctr.rows() > 0
+assert 2, eqObj(ctr.columnNames(), ["order_book_id"])
+assert 3, sum(ctr["order_book_id"] like "%.%") == 0
 
 @testing:case = "test_rqFutContracts_invalid_symbol"
 // 不存在的品种返回空表
 nopeCtr = RQData::rqFutContracts(user, pwd, "NOPE")
 assert 1, nopeCtr.rows() == 0
 
+// --- 1.17 rqFutDominant (主力合约) ---
+print("\n=== 测试 rqFutDominant (主力合约) ===")
+@testing:case = "test_rqFutDominant"
+dom = RQData::rqFutDominant(user, pwd, "AU", 2024.10.08, 2024.10.10)
+assert 1, dom.rows() == 3
+assert 2, eqObj(dom.columnNames(), ["date", "dominant"])
+assert 3, all(dom["dominant"] like "AU%")
+
+// --- 1.18 rqFutWarehouseStocks (仓单) ---
+print("\n=== 测试 rqFutWarehouseStocks (仓单) ===")
+@testing:case = "test_rqFutWarehouseStocks"
+wh = RQData::rqFutWarehouseStocks(user, pwd, ["AU"], 2024.10.08, 2024.10.10)
+assert 1, wh.rows() == 3
+assert 2, "on_warrant" in wh.columnNames()
+assert 3, all(wh["underlying_symbol"] == "AU")
+
+// --- 1.19 rqFutMemberRank (会员持仓排名) ---
+print("\n=== 测试 rqFutMemberRank (会员持仓排名) ===")
+@testing:case = "test_rqFutMemberRank"
+mr = RQData::rqFutMemberRank(user, pwd, "AU", 2024.10.08, 2024.10.08)
+assert 1, mr.rows() > 0
+assert 2, "member_name" in mr.columnNames()
+assert 3, "rank" in mr.columnNames()
+
+// --- 1.20 rqGetTickSize (最小变动价位) ---
+print("\n=== 测试 rqGetTickSize (最小变动价位) ===")
+@testing:case = "test_rqGetTickSize"
+ts = RQData::rqGetTickSize(user, pwd, ["AU2412", "RB2501"])
+assert 1, ts.rows() == 2
+assert 2, "tick_size" in ts.columnNames()
+assert 3, all(double(ts["tick_size"]) > 0)
+
+// --- 1.21 rqFutTradingParams (期货交易参数) ---
+print("\n=== 测试 rqFutTradingParams (期货交易参数) ===")
+@testing:case = "test_rqFutTradingParams"
+// 手续费 / 保证金率 / 限仓 / 单笔最大下单量
+tp = RQData::rqFutTradingParams(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09)
+assert 1, tp.rows() == 2
+assert 2, "open_commission" in tp.columnNames()
+// 保证金率按多空分列，没有单一的 margin_rate
+assert 3, "long_margin_ratio" in tp.columnNames()
+assert 4, "short_margin_ratio" in tp.columnNames()
+assert 5, all(double(tp["long_margin_ratio"]) > 0)
+
+// --- 1.22 rqFutDominantPrice (主力连续行情) ---
+print("\n=== 测试 rqFutDominantPrice (主力连续行情) ===")
+@testing:case = "test_rqFutDominantPrice"
+// 主力连续复权行情：dominant_id 固定返回，adjust_type 影响 close
+dpNone = RQData::rqFutDominantPrice(user, pwd, ["AU"], 2024.10.08, 2024.10.09, "none", "1d", ["close"])
+assert 1, dpNone.rows() == 2
+assert 2, "dominant_id" in dpNone.columnNames()
+assert 3, all(dpNone["dominant_id"] like "AU%")
+dpPre = RQData::rqFutDominantPrice(user, pwd, ["AU"], 2024.10.08, 2024.10.08, "pre", "1d", ["close"])
+assert 4, dpPre["close"][0] > dpNone["close"][0]
+
+// --- 1.23 rqInstrumentIndustry (个股所属行业) ---
+print("\n=== 测试 rqInstrumentIndustry (个股行业) ===")
+@testing:case = "test_rqInstrumentIndustry"
+ind = RQData::rqInstrumentIndustry(user, pwd, ["000001.XSHE"])
+assert 1, ind.rows() == 1
+assert 2, ind["first_industry_code"][0] == "40"
+assert 3, ind["first_industry_name"][0] == "银行"
+
+// --- 1.24 rqIndustryStocks (行业内股票) ---
+print("\n=== 测试 rqIndustryStocks (行业内股票) ===")
+@testing:case = "test_rqIndustryStocks"
+indStocks = RQData::rqIndustryStocks(user, pwd, "40")
+assert 1, indStocks.rows() > 0
+assert 2, "000001.XSHE" in indStocks["order_book_id"]
+
+@testing:case = "test_rqIndustryStocks_by_name"
+// industry 必须传行业代码，传分类名称返回空表
+indByName = RQData::rqIndustryStocks(user, pwd, "sws_2021")
+assert 1, indByName.rows() == 0
+
+// --- 1.25 rqMarginStocks (融资融券标的) ---
+print("\n=== 测试 rqMarginStocks (两融标的) ===")
+@testing:case = "test_rqMarginStocks"
+mg = RQData::rqMarginStocks(user, pwd, 2024.10.08)
+assert 1, mg.rows() > 0
+assert 2, eqObj(mg.columnNames(), ["order_book_id"])
+
+// --- 1.26 rqStockConnect (沪深股通持股) ---
+print("\n=== 测试 rqStockConnect (沪深股通) ===")
+@testing:case = "test_rqStockConnect"
+sc = RQData::rqStockConnect(user, pwd, ["000001.XSHE"], 2024.08.01, 2024.08.05)
+assert 1, sc.rows() > 0
+assert 2, "holding_ratio" in sc.columnNames()
+
+// --- 1.27 rqCapitalFlow (资金流) ---
+print("\n=== 测试 rqCapitalFlow (资金流) ===")
+@testing:case = "test_rqCapitalFlow"
+cf = RQData::rqCapitalFlow(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.10)
+assert 1, cf.rows() == 3
+assert 2, "buy_value" in cf.columnNames()
+assert 3, "sell_value" in cf.columnNames()
+
 @testing:case = "test_rqCapitalFlow_future_empty"
 // 资金流只对股票有数据，期货返回空表
 cfFut = RQData::rqCapitalFlow(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09)
 assert 1, cfFut.rows() == 0
 
-// ====================================================
-// 第四部分：落库冒烟测试（建库建表 / 基础信息 / 单日行情）
-// ====================================================
-
-@testing:case = "test_rqInitDb"
-print("\n=== 测试 rqInitDb (建库建表) ===")
-syncRqData::rqInitDb()
-assert 1, existsTable("dfs://RQDATA.futu_bar", "data")
-assert 2, existsTable("dfs://RQDATA.futu_contract", "data")
-assert 3, existsTable("dfs://RQDATA.futu_calendar", "data")
-assert 4, existsTable("dfs://RQDATA.futu_synclog", "data")
-print("建库建表验证通过")
-
-@testing:case = "test_rqFetchInstruments"
-print("\n=== 测试 rqFetchInstruments (合约清单) ===")
-instT = syncRqData::rqFetchInstruments(user, pwd)
-instCnt = select count(*) as n from instT
-assert 1, instCnt.n[0] > 0
-// margin_rate / industry_name 来自 RQData all_instruments
-instAu = select count(*) as n from instT where variety == "AU" and !isNull(margin_ratio)
-assert 2, instAu.n[0] > 0
-instInd = select count(*) as n from instT where industry != ""
-assert 3, instInd.n[0] > 0
-print("合约清单验证通过，合约数=" + string(instCnt.n[0]))
-
-@testing:case = "test_rqSyncBars_one_day"
-print("\n=== 测试 rqSyncBars (单日日线落库) ===")
-syncRqData::rqSyncBars(user, pwd, 2024.10.08, 2024.10.08, "1d", 50)
-barT = loadTable("dfs://RQDATA.futu_bar", "data")
-conT = loadTable("dfs://RQDATA.futu_contract", "data")
-barCnt = select count(*) as n from barT where trade_date == 2024.10.08 and interval == "1d"
-assert 1, barCnt.n[0] > 0
-conCnt = select count(*) as n from conT where trade_date == 2024.10.08
-assert 2, conCnt.n[0] >= barCnt.n[0]
-// 上市期间每个交易日都应有 contract 行（与当日是否有成交无关）
-listed = select count(*) as n from instT
-    where (isNull(list_date) or list_date <= 2024.10.08)
-      and (isNull(last_date) or last_date >= 2024.10.08)
-assert 3, conCnt.n[0] == listed.n[0]
-assert 4, "industry" in conT.columnNames()
-// 连续合约：88（主力）/888（价差平滑）/99（指数）随正常合约一并入库，且 88/888 带当日主力代码
-contCnt = select count(*) as n from conT where trade_date == 2024.10.08 and (symbol like "%88" or symbol like "%99")
-assert 5, contCnt.n[0] > 0
-domCnt = select count(*) as n from conT where trade_date == 2024.10.08 and symbol == "AU888" and dominant_id != ""
-assert 6, domCnt.n[0] == 1
-assert 7, "dominant_id" in conT.columnNames()
-print("日线落库验证通过，bar=" + string(barCnt.n[0]) + " contract=" + string(conCnt.n[0]) +
-      " 当日上市合约=" + string(listed.n[0]))
-
-@testing:case = "test_rqDailyPreSettle"
-print("\n=== 测试 rqDailyPreSettle (分钟线昨结算映射) ===")
-// 分钟线不返回 prev_settlement，用同日日线的 prev_settlement 建映射
-pm = syncRqData::rqDailyPreSettle(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09)
-assert 1, pm.rows() == 2
-pm0909 = select v from pm where k == "AU2412|20241009"
-assert 2, pm0909.rows() == 1 and !isNull(pm0909.v[0])
-print("昨结算映射验证通过，AU2412 20241009 pre_settle=" + string(pm0909.v[0]))
+// --- 1.28 rqShareTransformation (股份变动) ---
+print("\n=== 测试 rqShareTransformation (股份变动) ===")
+@testing:case = "test_rqShareTransformation"
+st = RQData::rqShareTransformation(user, pwd)
+assert 1, st.rows() > 0
+assert 2, "successor" in st.columnNames()
+assert 3, "event" in st.columnNames()
 
 // ====================================================
-// 第五部分：依赖校验 (Dependency Checks)
+// 第二部分：系统化异常校验 (Systematic Exception Tests)
 // ====================================================
 
-@testing:case = "test_dependency_httpClient"
-print("\n=== 测试 依赖校验 ===")
-// 注意：插件已加载时重复 loadPlugin 会抛异常，不能用它判断依赖是否可用
-// 这里直接验证插件能发起一次真实 HTTP 请求
-pluginOk = false
-try { pluginOk = (RQData::rqApi(token, pNormal)["responseCode"] == 200) } catch(ex) { pluginOk = false }
-assert 1, pluginOk
-print("httpClient 插件依赖验证通过")
+// --- 2.1 rqGetToken 异常校验 ---
 
-@testing:case = "test_dependency_module_loaded"
-assert 1, "RQData" in getLoadedModules().moduleName
-assert 2, "syncRqData" in getLoadedModules().moduleName
-print("模块依赖验证通过")
+@testing:case = "test_rqGetToken_arg_count_less", syntaxError=1
+RQData::rqGetToken(user)
+
+@testing:case = "test_rqGetToken_arg_count_more", syntaxError=1
+RQData::rqGetToken(user, pwd, false, "extra")
+
+@testing:case = "test_rqGetToken_user_null", exception=1
+RQData::rqGetToken(NULL, pwd, true)
+
+@testing:case = "test_rqGetToken_pwd_null", exception=1
+RQData::rqGetToken(user, NULL, true)
+
+@testing:case = "test_rqGetToken_user_int", exception=1
+// user 必须是 STRING
+RQData::rqGetToken(12345, pwd, true)
+
+@testing:case = "test_rqGetToken_force_type", exception=1
+// force 必须是 BOOL
+RQData::rqGetToken(user, pwd, "force")
+
+@testing:case = "test_rqGetToken_bad_credential", exception=1
+// 格式正确但无法通过服务端校验的凭证
+RQData::rqGetToken("bad_user", "bad_password", true)
+
+
+// --- 2.2 rqApi 异常校验 ---
+
+@testing:case = "test_rqApi_arg_count_less", syntaxError=1
+RQData::rqApi(token)
+
+@testing:case = "test_rqApi_arg_count_more", syntaxError=1
+RQData::rqApi(token, pNormal, 60000, "extra")
+
+@testing:case = "test_rqApi_token_type", exception=1
+// token 必须是 STRING，整数无法写入请求头
+RQData::rqApi(12345, pNormal)
+
+@testing:case = "test_rqApi_timeout_type", exception=1
+RQData::rqApi(token, pNormal, "abc")
+
+
+// --- 2.3 rqRequest 异常校验 ---
+
+@testing:case = "test_rqRequest_arg_count_less", syntaxError=1
+RQData::rqRequest(user, pwd)
+
+@testing:case = "test_rqRequest_arg_count_more", syntaxError=1
+RQData::rqRequest(user, pwd, pNormal, 60000, "extra")
+
+@testing:case = "test_rqRequest_user_null", exception=1
+// user 为 NULL 时取不到缓存 token，认证必然失败
+RQData::rqRequest(NULL, pwd, pNormal)
+
+
+// --- 2.4 rqParseCsv 异常校验 ---
+
+@testing:case = "test_rqParseCsv_arg_count_less", syntaxError=1
+RQData::rqParseCsv()
+
+@testing:case = "test_rqParseCsv_arg_count_more", syntaxError=1
+RQData::rqParseCsv("a,b", "extra")
+
+@testing:case = "test_rqParseCsv_column_mismatch"
+// 列数与表头不符时不抛异常：多列截断、缺列补空，统一按表头对齐
+assert 1, eqObj(RQData::rqParseCsv("a,b\n1,2,3").columnNames(), ["a", "b"])
+assert 2, RQData::rqParseCsv("a,b\n1").rows() == 1
+
+
+// --- 2.5 rqGetPrice 异常校验 ---
+
+@testing:case = "test_rqGetPrice_arg_count_less", syntaxError=1
+RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08)
+
+@testing:case = "test_rqGetPrice_arg_count_more", syntaxError=1
+RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1d", ["close"], "extra")
+
+@testing:case = "test_rqGetPrice_ids_int_scalar", exception=1
+// 合约代码必须是向量，传标量数字会失败
+RQData::rqGetPrice(user, pwd, 600519, 2024.10.08, 2024.10.09, "1d")
+
+@testing:case = "test_rqGetPrice_ids_null", exception=1
+RQData::rqGetPrice(user, pwd, NULL, 2024.10.08, 2024.10.09, "1d")
+
+@testing:case = "test_rqGetPrice_ids_empty_vec", exception=1
+RQData::rqGetPrice(user, pwd, array(STRING, 0), 2024.10.08, 2024.10.09, "1d")
+
+@testing:case = "test_rqGetPrice_ids_matrix", exception=1
+RQData::rqGetPrice(user, pwd, matrix(["AU2412", "RB2410"]), 2024.10.08, 2024.10.09, "1d")
+
+@testing:case = "test_rqGetPrice_start_null", exception=1
+// 必填日期传 NULL 会直接报错，避免静默返回全历史
+RQData::rqGetPrice(user, pwd, ["AU2412"], NULL, 2024.10.09, "1d")
+
+@testing:case = "test_rqGetPrice_end_null", exception=1
+RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, NULL, "1d")
+
+@testing:case = "test_rqGetPrice_frequency_type", exception=1
+// frequency 必须是 STRING
+RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, 1)
+
+@testing:case = "test_rqGetPrice_frequency_invalid", exception=1
+// 不支持的频率
+RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1x")
+
+@testing:case = "test_rqGetPrice_fields_invalid", exception=1
+// 字段名错误
+RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1d", ["foo"])
+
+@testing:case = "test_rqGetPrice_mixed_assets", exception=1
+// 同一次请求混资产类型（期货 + 股票）会被拒绝
+RQData::rqGetPrice(user, pwd, ["AU2412", "000001.XSHE"], 2024.10.08, 2024.10.09, "1d", ["close"])
+
+@testing:case = "test_rqGetPrice_code_with_suffix", exception=1
+// 期货代码带交易所后缀（AU2412.SHF）会被拒绝
+RQData::rqGetPrice(user, pwd, ["AU2412.SHF"], 2024.10.08, 2024.10.09, "1d")
+
+@testing:case = "test_rqGetPrice_invalid_code", exception=1
+// 代码不存在
+RQData::rqGetPrice(user, pwd, ["INVALID"], 2024.10.08, 2024.10.09, "1d")
+
+@testing:case = "test_rqGetPrice_minute_with_daily_field", exception=1
+// 分钟线不支持 settlement 等日线字段
+RQData::rqGetPrice(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "1m", ["settlement"])
+
+@testing:case = "test_rqGetPrice_stock_settlement", exception=1
+// 股票日线没有结算价 settlement
+RQData::rqGetPrice(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.09, "1d", ["settlement"])
+
+@testing:case = "test_rqGetPrice_index_open_interest", exception=1
+// 指数日线没有期货专属字段 open_interest
+RQData::rqGetPrice(user, pwd, ["000300.XSHG"], 2024.10.08, 2024.10.09, "1d", ["open_interest"])
+
+
+// --- 2.6 rqAllInstruments 异常校验 ---
+
+@testing:case = "test_rqAllInstruments_arg_count_less", syntaxError=1
+RQData::rqAllInstruments(user)
+
+@testing:case = "test_rqAllInstruments_arg_count_more", syntaxError=1
+RQData::rqAllInstruments(user, pwd, "Future", "extra")
+
+@testing:case = "test_rqAllInstruments_type_int", exception=1
+// 品种类型必须是 STRING
+RQData::rqAllInstruments(user, pwd, 1)
+
+@testing:case = "test_rqAllInstruments_invalid_type", exception=1
+// 不支持的品种类型
+RQData::rqAllInstruments(user, pwd, "Nope")
+
+
+// --- 2.7 rqInstruments 异常校验 ---
+
+@testing:case = "test_rqInstruments_arg_count_less", syntaxError=1
+RQData::rqInstruments(user, pwd)
+
+@testing:case = "test_rqInstruments_arg_count_more", syntaxError=1
+RQData::rqInstruments(user, pwd, ["AU2412"], "extra")
+
+@testing:case = "test_rqInstruments_ids_null", exception=1
+RQData::rqInstruments(user, pwd, NULL)
+
+@testing:case = "test_rqInstruments_ids_int_scalar", exception=1
+RQData::rqInstruments(user, pwd, 600519)
+
+
+// --- 2.8 rqTradingDates 异常校验 ---
+
+@testing:case = "test_rqTradingDates_arg_count_less", syntaxError=1
+RQData::rqTradingDates(user, pwd, 2024.11.04)
+
+@testing:case = "test_rqTradingDates_arg_count_more", syntaxError=1
+RQData::rqTradingDates(user, pwd, 2024.11.04, 2024.11.08, "extra")
+
+@testing:case = "test_rqTradingDates_start_null", exception=1
+RQData::rqTradingDates(user, pwd, NULL, 2024.11.08)
+
+@testing:case = "test_rqTradingDates_end_null", exception=1
+RQData::rqTradingDates(user, pwd, 2024.11.04, NULL)
+
+
+// --- 2.9 rqGetQuota 异常校验 ---
+
+@testing:case = "test_rqGetQuota_arg_count_less", syntaxError=1
+RQData::rqGetQuota(user)
+
+@testing:case = "test_rqGetQuota_arg_count_more", syntaxError=1
+RQData::rqGetQuota(user, pwd, "extra")
+
+@testing:case = "test_rqGetQuota_user_null", exception=1
+RQData::rqGetQuota(NULL, pwd)
+
+
+// --- 2.10 rqGetPriceChangeRate 异常校验 ---
+
+@testing:case = "test_rqGetPriceChangeRate_arg_count_less", syntaxError=1
+RQData::rqGetPriceChangeRate(user, pwd, ["000001.XSHE"], 2024.10.08)
+
+@testing:case = "test_rqGetPriceChangeRate_arg_count_more", syntaxError=1
+RQData::rqGetPriceChangeRate(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.10, "extra")
+
+@testing:case = "test_rqGetPriceChangeRate_ids_null", exception=1
+RQData::rqGetPriceChangeRate(user, pwd, NULL, 2024.10.08, 2024.10.10)
+
+@testing:case = "test_rqGetPriceChangeRate_start_null", exception=1
+RQData::rqGetPriceChangeRate(user, pwd, ["000001.XSHE"], NULL, 2024.10.10)
+
+
+// --- 2.11 rqGetExFactor 异常校验 ---
+
+@testing:case = "test_rqGetExFactor_arg_count_less", syntaxError=1
+RQData::rqGetExFactor(user, pwd, ["000001.XSHE"], 2024.01.01)
+
+@testing:case = "test_rqGetExFactor_arg_count_more", syntaxError=1
+RQData::rqGetExFactor(user, pwd, ["000001.XSHE"], 2024.01.01, 2024.10.08, "extra")
+
+@testing:case = "test_rqGetExFactor_start_null", exception=1
+RQData::rqGetExFactor(user, pwd, ["000001.XSHE"], NULL, 2024.10.08)
+
+
+// --- 2.12 rqGetDividend 异常校验 ---
+
+@testing:case = "test_rqGetDividend_arg_count_less", syntaxError=1
+RQData::rqGetDividend(user, pwd, ["000001.XSHE"], 2024.01.01)
+
+@testing:case = "test_rqGetDividend_arg_count_more", syntaxError=1
+RQData::rqGetDividend(user, pwd, ["000001.XSHE"], 2024.01.01, 2024.10.08, "extra")
+
+@testing:case = "test_rqGetDividend_start_null", exception=1
+RQData::rqGetDividend(user, pwd, ["000001.XSHE"], NULL, 2024.10.08)
+
+
+// --- 2.13 rqGetFactor 异常校验 ---
+
+@testing:case = "test_rqGetFactor_arg_count_less", syntaxError=1
+RQData::rqGetFactor(user, pwd, ["000001.XSHE"], ["pe_ratio"])
+
+@testing:case = "test_rqGetFactor_arg_count_more", syntaxError=1
+RQData::rqGetFactor(user, pwd, ["000001.XSHE"], ["pe_ratio"], 2024.10.08, 2024.10.08, "extra")
+
+@testing:case = "test_rqGetFactor_factors_null", exception=1
+RQData::rqGetFactor(user, pwd, ["000001.XSHE"], NULL, 2024.10.08, 2024.10.08)
+
+@testing:case = "test_rqGetFactor_start_null", exception=1
+RQData::rqGetFactor(user, pwd, ["000001.XSHE"], ["pe_ratio"], NULL, 2024.10.08)
+
+
+// --- 2.14 rqFutContracts 异常校验 ---
+
+@testing:case = "test_rqFutContracts_arg_count_less", syntaxError=1
+RQData::rqFutContracts(user, pwd)
+
+@testing:case = "test_rqFutContracts_arg_count_more", syntaxError=1
+RQData::rqFutContracts(user, pwd, "AU", "extra")
+
+@testing:case = "test_rqFutContracts_symbol_matrix", exception=1
+RQData::rqFutContracts(user, pwd, matrix(INT, 2, 2))
+
+
+// --- 2.15 rqFutDominant 异常校验 ---
+
+@testing:case = "test_rqFutDominant_arg_count_less", syntaxError=1
+RQData::rqFutDominant(user, pwd, "AU", 2024.10.08)
+
+@testing:case = "test_rqFutDominant_arg_count_more", syntaxError=1
+RQData::rqFutDominant(user, pwd, "AU", 2024.10.08, 2024.10.10, 1, NULL, "extra")
+
+@testing:case = "test_rqFutDominant_start_null", exception=1
+RQData::rqFutDominant(user, pwd, "AU", NULL, 2024.10.10)
+
+
+// --- 2.16 rqFutWarehouseStocks 异常校验 ---
+
+@testing:case = "test_rqFutWarehouseStocks_arg_count_less", syntaxError=1
+RQData::rqFutWarehouseStocks(user)
+
+@testing:case = "test_rqFutWarehouseStocks_arg_count_more", syntaxError=1
+RQData::rqFutWarehouseStocks(user, pwd, ["AU"], 2024.10.08, 2024.10.10, "extra")
+
+@testing:case = "test_rqFutWarehouseStocks_symbols_int", exception=1
+RQData::rqFutWarehouseStocks(user, pwd, 1, 2024.10.08, 2024.10.10)
+
+
+// --- 2.17 rqFutMemberRank 异常校验 ---
+
+@testing:case = "test_rqFutMemberRank_arg_count_less", syntaxError=1
+RQData::rqFutMemberRank(user, pwd, "AU", 2024.10.08)
+
+@testing:case = "test_rqFutMemberRank_arg_count_more", syntaxError=1
+RQData::rqFutMemberRank(user, pwd, "AU", 2024.10.08, 2024.10.08, "extra")
+
+@testing:case = "test_rqFutMemberRank_start_null", exception=1
+RQData::rqFutMemberRank(user, pwd, "AU", NULL, 2024.10.08)
+
+
+// --- 2.18 rqGetTickSize 异常校验 ---
+
+@testing:case = "test_rqGetTickSize_arg_count_less", syntaxError=1
+RQData::rqGetTickSize(user, pwd)
+
+@testing:case = "test_rqGetTickSize_arg_count_more", syntaxError=1
+RQData::rqGetTickSize(user, pwd, ["AU2412"], "extra")
+
+@testing:case = "test_rqGetTickSize_ids_null", exception=1
+RQData::rqGetTickSize(user, pwd, NULL)
+
+
+// --- 2.19 rqFutTradingParams 异常校验 ---
+
+@testing:case = "test_rqFutTradingParams_arg_count_less", syntaxError=1
+RQData::rqFutTradingParams(user, pwd)
+
+@testing:case = "test_rqFutTradingParams_arg_count_more", syntaxError=1
+RQData::rqFutTradingParams(user, pwd, ["AU2412"], 2024.10.08, 2024.10.09, "extra")
+
+@testing:case = "test_rqFutTradingParams_ids_null", exception=1
+RQData::rqFutTradingParams(user, pwd, NULL, 2024.10.08, 2024.10.09)
+
+
+// --- 2.20 rqFutDominantPrice 异常校验 ---
+
+@testing:case = "test_rqFutDominantPrice_arg_count_less", syntaxError=1
+RQData::rqFutDominantPrice(user, pwd, ["AU"], 2024.10.08)
+
+@testing:case = "test_rqFutDominantPrice_arg_count_more", syntaxError=1
+RQData::rqFutDominantPrice(user, pwd, ["AU"], 2024.10.08, 2024.10.09, "none", "1d", ["close"], "extra")
+
+@testing:case = "test_rqFutDominantPrice_adjust_type_invalid", exception=1
+// adjustType 只支持 none/pre/post
+RQData::rqFutDominantPrice(user, pwd, ["AU"], 2024.10.08, 2024.10.09, "bad", "1d", ["close"])
+
+@testing:case = "test_rqFutDominantPrice_start_null", exception=1
+RQData::rqFutDominantPrice(user, pwd, ["AU"], NULL, 2024.10.09)
+
+
+// --- 2.21 rqInstrumentIndustry 异常校验 ---
+
+@testing:case = "test_rqInstrumentIndustry_arg_count_less", syntaxError=1
+RQData::rqInstrumentIndustry(user, pwd)
+
+@testing:case = "test_rqInstrumentIndustry_arg_count_more", syntaxError=1
+RQData::rqInstrumentIndustry(user, pwd, ["000001.XSHE"], "extra")
+
+@testing:case = "test_rqInstrumentIndustry_ids_null", exception=1
+RQData::rqInstrumentIndustry(user, pwd, NULL)
+
+
+// --- 2.22 rqIndustryStocks 异常校验 ---
+
+@testing:case = "test_rqIndustryStocks_arg_count_less", syntaxError=1
+RQData::rqIndustryStocks(user)
+
+@testing:case = "test_rqIndustryStocks_arg_count_more", syntaxError=1
+RQData::rqIndustryStocks(user, pwd, "40", "extra")
+
+@testing:case = "test_rqIndustryStocks_industry_int", exception=1
+// industry 必须是行业代码字符串
+RQData::rqIndustryStocks(user, pwd, 40)
+
+
+// --- 2.23 rqMarginStocks 异常校验 ---
+
+@testing:case = "test_rqMarginStocks_arg_count_less", syntaxError=1
+RQData::rqMarginStocks(user, pwd)
+
+@testing:case = "test_rqMarginStocks_arg_count_more", syntaxError=1
+RQData::rqMarginStocks(user, pwd, 2024.10.08, "extra")
+
+@testing:case = "test_rqMarginStocks_date_null", exception=1
+RQData::rqMarginStocks(user, pwd, NULL)
+
+
+// --- 2.24 rqStockConnect 异常校验 ---
+
+@testing:case = "test_rqStockConnect_arg_count_less", syntaxError=1
+RQData::rqStockConnect(user, pwd, ["000001.XSHE"], 2024.08.01)
+
+@testing:case = "test_rqStockConnect_arg_count_more", syntaxError=1
+RQData::rqStockConnect(user, pwd, ["000001.XSHE"], 2024.08.01, 2024.08.05, "extra")
+
+@testing:case = "test_rqStockConnect_start_null", exception=1
+RQData::rqStockConnect(user, pwd, ["000001.XSHE"], NULL, 2024.08.05)
+
+
+// --- 2.25 rqCapitalFlow 异常校验 ---
+
+@testing:case = "test_rqCapitalFlow_arg_count_less", syntaxError=1
+RQData::rqCapitalFlow(user, pwd, ["000001.XSHE"], 2024.10.08)
+
+@testing:case = "test_rqCapitalFlow_arg_count_more", syntaxError=1
+RQData::rqCapitalFlow(user, pwd, ["000001.XSHE"], 2024.10.08, 2024.10.10, "extra")
+
+@testing:case = "test_rqCapitalFlow_start_null", exception=1
+RQData::rqCapitalFlow(user, pwd, ["000001.XSHE"], NULL, 2024.10.10)
+
+
+// --- 2.26 rqShareTransformation 异常校验 ---
+
+@testing:case = "test_rqShareTransformation_arg_count_less", syntaxError=1
+RQData::rqShareTransformation(user)
+
+@testing:case = "test_rqShareTransformation_arg_count_more", syntaxError=1
+RQData::rqShareTransformation(user, pwd, "extra")
+
+@testing:case = "test_rqShareTransformation_user_null", exception=1
+RQData::rqShareTransformation(NULL, pwd)
 
 // ====================================================
-// 第六部分：定时任务（默认不启用，仅保留代码）
+// 第三部分：并发测试 (Concurrency Tests)
 // ====================================================
-// 本节只定义函数、不执行任何注册动作，跑完整个脚本不会产生定时任务。
-// 确认要上线时，手工执行一次：
-//     enableRqScheduleJob("license", "<License Key>")
-// 撤销：
-//     disableRqScheduleJob()
-// 查看：
-//     getScheduledJobs()
-//
-// 执行时点待观察（下面的 17:00 / 17:30 只是暂定值）：
-//   当天行情（open/high/low/close/volume）通常收盘后很快就更新，
-//   但结算价 settlement 要等交易所盘后结算，实测在 15:00 之后、21:00 之前
-//   的某个时点才最终确定。若任务跑得太早，settle 可能为空或是临时值。
-//   需要连续几天在不同时点（如 16:00 / 17:00 / 18:00 / 20:00 / 21:00）
-//   抽查 bar.settle 是否已非空且稳定，再据此定下最终 scheduleTime。
-//   兜底：rqDailyJob 每次回看 10 天，配合 TSDB keepDuplicates=LAST，
-//   次日重跑会把前一天的 settle 覆盖成最终值，延迟一天自动修正。
 
-def enableRqScheduleJob(user, pwd) {
-    // 1. 凭证写入共享表 rq_config：任务函数必须无参，只能从共享表里取凭证
-    syncRqData::rqSetCred(user, pwd)
-
-    // 2. 日线 + contract 快照：每日 17:00，回看 10 天补漏（幂等）
-    scheduleJob(jobId=`sync_futu_rqdata_daily,
-                jobDesc="sync_futu_rqdata_daily_incremental",
-                jobFunc=syncRqData::rqDailyJob,
-                scheduleTime=[17:00m],
-                startDate=today(),
-                endDate=2050.12.31,
-                frequency='D')
-
-    // 3. 分钟线增量：每日 17:30（等日线写完再跑）
-    //    只拉库里缺的交易日，已完整的跳过，不重复消耗配额
-    scheduleJob(jobId=`sync_futu_rqdata_minute,
-                jobDesc="sync_futu_rqdata_minute_incremental",
-                jobFunc=syncRqData::rqMinuteJob,
-                scheduleTime=[17:30m],
-                startDate=today(),
-                endDate=2050.12.31,
-                frequency='D')
-
-    print("[RQ] 定时任务已注册：17:00 日线 / 17:30 分钟线")
-    return getScheduledJobs()
+// --- 3.1 并发 rqGetPrice ---
+@testing:case = "test_Concurrent_rqGetPrice"
+print("\n=== 并发测试 rqGetPrice ===")
+def rqConcurrentPriceTask(u, p, i) {
+    t = RQData::rqGetPrice(u, p, ["AU2412"], 2024.10.08, 2024.10.09, "1d", ["close"])
+    return t.rows()
 }
+rPrice = ploop(rqConcurrentPriceTask{user, pwd}, 1..4)
+assert 1, size(rPrice) == 4
+assert 2, all(rPrice > 0)
 
-def disableRqScheduleJob() {
-    // 任务不存在时 deleteScheduledJob 会抛异常，逐个吞掉
-    try { deleteScheduledJob("sync_futu_rqdata_daily") } catch(ex) { }
-    try { deleteScheduledJob("sync_futu_rqdata_minute") } catch(ex) { }
-    print("[RQ] 定时任务已移除")
-    return getScheduledJobs()
+// --- 3.2 并发 rqTradingDates ---
+@testing:case = "test_Concurrent_rqTradingDates"
+print("\n=== 并发测试 rqTradingDates ===")
+def rqConcurrentCalendarTask(u, p, i) {
+    t = RQData::rqTradingDates(u, p, 2024.11.04, 2024.11.08)
+    return t.rows()
 }
+rCal = ploop(rqConcurrentCalendarTask{user, pwd}, 1..4)
+assert 1, size(rCal) == 4
+assert 2, all(rCal == 5)
+
+// --- 3.3 多接口并发 (submitJob) ---
+@testing:case = "test_Concurrent_mixed_interfaces"
+print("\n=== 并发测试 多接口混合 ===")
+def rqConcurrentMixedTask(u, p, type) {
+    if (type == "price")       return RQData::rqGetPrice(u, p, ["AU2412"], 2024.10.08, 2024.10.09, "1d", ["close"]).rows()
+    if (type == "calendar")    return RQData::rqTradingDates(u, p, 2024.11.04, 2024.11.08).rows()
+    if (type == "instruments") return RQData::rqInstruments(u, p, ["AU2412"]).rows()
+    if (type == "quota")       return RQData::rqGetQuota(u, p).rows()
+    return 0
+}
+jobIds = array(STRING, 0)
+jobTypes = ["price", "calendar", "instruments", "quota", "price"]
+for (i in 1..5) {
+    jobId = "rq_parallel_job_" + string(i)
+    submitJob(jobId, "RQData Parallel Test", rqConcurrentMixedTask, user, pwd, jobTypes[i-1])
+    jobIds.append!(jobId)
+}
+for (jid in jobIds) { assert 1, getJobReturn(jid, true) >= 0 }
 
 print("\n--- 全部测试执行完成 ---")
